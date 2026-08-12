@@ -13,6 +13,7 @@ import * as fv from './vault/favorites-vault.js';
 import * as inject from './tools/inject.js';
 import * as browser from './tools/browser.js';
 import * as cache from './db/search-cache.js';
+import * as secretScan from './tools/secret-scan.js';
 import { auditLog } from './audit.js';
 
 // ─── Client cache (one per vault instance, reuses session) ────────────────────
@@ -336,6 +337,27 @@ const TOOLS: Tool[] = [
         secretRefs: { type: 'object', additionalProperties: { type: 'string' } },
       },
       required: ['url', 'secretRefs'],
+    },
+  },
+
+  // ── Secret scanning ───────────────────────────────────────────────────────────
+  {
+    name: 'vault_scan_secrets',
+    description:
+      'Scan a project directory for hardcoded secrets (API keys, tokens, private keys, passwords) BEFORE committing or pushing. ' +
+      'Scans git-tracked, staged, and untracked-but-not-ignored files (or all files if not a git repo); matched values are redacted, never returned in full.\n\n' +
+      'If findings are returned: do NOT push. For each finding, move the real value into a project vault instead — ' +
+      '(1) vault_init_project if this project has no project vault yet, ' +
+      '(2) vault_project_create_item to store the actual secret, ' +
+      '(3) replace the hardcoded value in the file with a {{placeholder}} referencing that item, and use vault_project_run_command / ' +
+      'vault_project_write_file / vault_project_http_request to inject it at runtime instead of committing it. ' +
+      'Re-run vault_scan_secrets afterwards to confirm the tree is clean before pushing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to the directory to scan (usually the project/repo root).' },
+      },
+      required: ['path'],
     },
   },
 
@@ -940,6 +962,29 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
         n => client.resolveValue(n), url, method ?? 'GET',
         { headers, body, secretRefs },
       );
+    }
+
+    // ── Secret scanning ───────────────────────────────────────────────────────
+
+    case 'vault_scan_secrets': {
+      const { path: dir } = args as { path: string };
+      const result = secretScan.scanForSecrets(dir);
+      auditLog('scan_secrets', 'local', undefined, { path: dir, findings: String(result.findings.length) });
+      if (result.findings.length === 0) {
+        return {
+          scanned: result.scanned, usedGit: result.usedGit, findings: [],
+          message: 'No likely hardcoded secrets found. Note: this is a heuristic scan, not a guarantee — still review manually before pushing anything sensitive.',
+        };
+      }
+      return {
+        scanned: result.scanned, usedGit: result.usedGit, findings: result.findings,
+        action_required:
+          'Do NOT push yet. For each finding: move the real value into the project vault ' +
+          '(vault_init_project if needed, then vault_project_create_item), replace the hardcoded value in the ' +
+          'file with a {{placeholder}}, and inject it at runtime via vault_project_run_command / ' +
+          'vault_project_write_file / vault_project_http_request instead. Re-run vault_scan_secrets to confirm ' +
+          'the tree is clean before pushing.',
+      };
     }
 
     // ── Browser automation ───────────────────────────────────────────────────
