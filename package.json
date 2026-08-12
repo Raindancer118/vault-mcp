@@ -1,0 +1,35 @@
+{
+  "name": "vault-mcp",
+  "version": "1.1.1",
+  "description": "Secure secrets management MCP server with Vaultwarden and project vault support",
+  "type": "module",
+  "bin": {
+    "vault-mcp": "./dist/index.js",
+    "vault-launch": "./dist/launch.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "better-sqlite3": "^12.10.0",
+    "fuse.js": "^7.4.1",
+    "playwright": "^1.60.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.0.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.10.0": true,
+    "esbuild@0.28.0": true
+  }
+}
