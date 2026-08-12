@@ -17,8 +17,20 @@ export function getProjectsDir(): string {
   return join(getConfigDir(), 'projects');
 }
 
+/**
+ * Secondary, redundant local-only backup location for committed-project-vault secrets
+ * (dedicated vault key + TOTP seed) — never in the repo, never synced anywhere. Lives
+ * under Claude Code's own per-user config dir rather than a password manager note, so
+ * a committed vault keeps decrypting automatically on this machine even if
+ * ~/.config/vault-mcp/projects gets wiped (e.g. a config reset). Override via
+ * VAULT_MCP_CLAUDE_DIR for tests, same pattern as VAULT_MCP_CONFIG_DIR.
+ */
+export function getClaudeBackupsDir(): string {
+  return join(process.env.VAULT_MCP_CLAUDE_DIR ?? join(homedir(), '.claude'), 'vault-mcp-backups');
+}
+
 export function ensureConfigDirs(): void {
-  for (const dir of [getConfigDir(), getProjectsDir(), join(homedir(), '.cache', 'vault-mcp')]) {
+  for (const dir of [getConfigDir(), getProjectsDir(), getClaudeBackupsDir(), join(homedir(), '.cache', 'vault-mcp')]) {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 }

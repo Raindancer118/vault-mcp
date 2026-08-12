@@ -8,24 +8,29 @@ import {
   updateProjectItem, deleteProjectItem, resolveProjectValue,
   enableTotp, enableCommitStorage,
 } from './project-vault.js';
-import { getProjectsDir } from '../config/loader.js';
+import { getProjectsDir, getClaudeBackupsDir } from '../config/loader.js';
 
 const MASTER_KEY = randomBytes(32).toString('hex');
 const OTHER_MASTER_KEY = randomBytes(32).toString('hex');
 
 describe('project-vault', () => {
   let configDir: string;
+  let claudeDir: string;
   let projectDir: string;
 
   beforeEach(() => {
     configDir = mkdtempSync(join(tmpdir(), 'vault-mcp-config-'));
+    claudeDir = mkdtempSync(join(tmpdir(), 'vault-mcp-claude-'));
     projectDir = mkdtempSync(join(tmpdir(), 'vault-mcp-project-'));
     process.env.VAULT_MCP_CONFIG_DIR = configDir;
+    process.env.VAULT_MCP_CLAUDE_DIR = claudeDir;
   });
 
   afterEach(() => {
     delete process.env.VAULT_MCP_CONFIG_DIR;
+    delete process.env.VAULT_MCP_CLAUDE_DIR;
     rmSync(configDir, { recursive: true, force: true });
+    rmSync(claudeDir, { recursive: true, force: true });
     rmSync(projectDir, { recursive: true, force: true });
   });
 
@@ -88,32 +93,84 @@ describe('project-vault', () => {
       expect(resolveProjectValue(MASTER_KEY, projectDir, 'second')).toBe('another-value');
     });
 
-    it('throws a clear error when the local TOTP seed file is missing', () => {
+    it('throws a clear error when both the primary and the ~/.claude backup TOTP seed are missing', () => {
       const { marker } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
       createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
       rmSync(join(getProjectsDir(), `${marker.id}.totp`));
+      rmSync(join(getClaudeBackupsDir(), `${marker.id}.json`));
       expect(() => resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toThrow(/TOTP seed/);
     });
 
-    it('throws a clear error when the local dedicated vault key file is missing, even with the TOTP seed intact', () => {
+    it('throws a clear error when both the primary and the ~/.claude backup vault key are missing', () => {
       const { marker } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
       createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
       rmSync(join(getProjectsDir(), `${marker.id}.key`));
+      rmSync(join(getClaudeBackupsDir(), `${marker.id}.json`));
       expect(() => resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toThrow(/vault key/);
     });
 
-    it('cannot be decrypted with the master key alone if the TOTP seed is missing (master key plays no role here at all)', () => {
+    it('cannot be decrypted with the master key alone if both TOTP seed copies are missing (master key plays no role here at all)', () => {
       const { marker } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
       createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
       rmSync(join(getProjectsDir(), `${marker.id}.totp`));
+      rmSync(join(getClaudeBackupsDir(), `${marker.id}.json`));
       expect(() => listProjectItems(MASTER_KEY, projectDir)).toThrow();
     });
 
-    it('cannot be decrypted with only the TOTP seed if the dedicated vault key is missing', () => {
+    it('cannot be decrypted with only the TOTP seed if both vault key copies are missing', () => {
       const { marker } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
       createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
       rmSync(join(getProjectsDir(), `${marker.id}.key`));
+      rmSync(join(getClaudeBackupsDir(), `${marker.id}.json`));
       expect(() => listProjectItems(MASTER_KEY, projectDir)).toThrow();
+    });
+  });
+
+  describe('automatic ~/.claude backup + fallback restore for committed vaults', () => {
+    it('writes a redundant backup of both secrets under ~/.claude on init', () => {
+      const { marker, totpSeedBase32, vaultKeyHex } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+      const backupPath = join(getClaudeBackupsDir(), `${marker.id}.json`);
+      expect(existsSync(backupPath)).toBe(true);
+      const backup = JSON.parse(readFileSync(backupPath, 'utf-8'));
+      expect(backup.totpSeedBase32).toBe(totpSeedBase32);
+      expect(backup.vaultKeyHex).toBe(vaultKeyHex);
+    });
+
+    it('falls back to the ~/.claude backup and keeps working when the primary vault key file is wiped', () => {
+      initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+      createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
+      const marker = getProjectInfo(projectDir)!;
+      rmSync(join(getProjectsDir(), `${marker.id}.key`));
+      expect(resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toBe('s3cr3t-value');
+    });
+
+    it('falls back to the ~/.claude backup and keeps working when the primary TOTP seed file is wiped', () => {
+      initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+      createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
+      const marker = getProjectInfo(projectDir)!;
+      rmSync(join(getProjectsDir(), `${marker.id}.totp`));
+      expect(resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toBe('s3cr3t-value');
+    });
+
+    it('still works when the entire primary vault-mcp config dir is wiped, restoring both files transparently', () => {
+      const { marker } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+      createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
+      rmSync(join(getProjectsDir(), `${marker.id}.key`));
+      rmSync(join(getProjectsDir(), `${marker.id}.totp`));
+
+      expect(resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toBe('s3cr3t-value');
+      // Using the backup should also have restored the primary copies for next time.
+      expect(existsSync(join(getProjectsDir(), `${marker.id}.key`))).toBe(true);
+      expect(existsSync(join(getProjectsDir(), `${marker.id}.totp`))).toBe(true);
+    });
+
+    it('writes a fresh ~/.claude backup when enableCommitStorage mints a new vault key', () => {
+      initProjectVault(MASTER_KEY, projectDir, 'demo');
+      enableTotp(MASTER_KEY, projectDir);
+      const { vaultKeyHex } = enableCommitStorage(MASTER_KEY, projectDir);
+      const marker = getProjectInfo(projectDir)!;
+      const backup = JSON.parse(readFileSync(join(getClaudeBackupsDir(), `${marker.id}.json`), 'utf-8'));
+      expect(backup.vaultKeyHex).toBe(vaultKeyHex);
     });
   });
 

@@ -489,10 +489,13 @@ const TOOLS: Tool[] = [
       'can be committed and pushed alongside the code. This forces TOTP protection on, AND mints a dedicated, ' +
       'single-purpose 512-bit vault key — both stored only locally, never in the repo, and both required together ' +
       'to decrypt. Deliberately independent of this machine\'s shared master key: leaking the master key (shared ' +
-      'across every vault on this machine) has zero effect on a committed vault. Every machine that needs to use ' +
-      'the vault needs its own local copy of BOTH files. The response includes the vault key and TOTP seed ONCE — ' +
-      'back both up immediately as separate items (e.g. two notes in a Bitwarden vault, never in this repo) or the ' +
-      'committed vault becomes permanently unrecoverable if this machine is lost.',
+      'across every vault on this machine) has zero effect on a committed vault. Both secrets are automatically ' +
+      'written to ~/.config/vault-mcp/projects/ (primary) AND redundantly backed up under ' +
+      '~/.claude/vault-mcp-backups/ on this machine — if the primary copy ever goes missing, the vault ' +
+      'transparently falls back to and self-heals from that backup, no manual restore needed. Neither location is ' +
+      'ever part of this repo. A machine that has never touched this project vault before still needs one of ' +
+      'those two local copies though — the response includes the vault key and TOTP seed ONCE for that purpose; ' +
+      'note them down if you may need to set this up on another machine.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -533,8 +536,9 @@ const TOOLS: Tool[] = [
       'Move an existing project vault\'s encrypted file from local machine config into the repo (as ' +
       '.vault-project.enc) so it can be committed and pushed. Requires TOTP to already be enabled ' +
       '(run vault_project_totp_enable first) — refuses otherwise. Mints a brand-new dedicated 512-bit vault key ' +
-      'and re-encrypts everything under it plus the TOTP seed, independent of the shared master key. Returns the ' +
-      'new vault key ONCE — back it up immediately (e.g. as a note in a Bitwarden vault, never in this repo).',
+      'and re-encrypts everything under it plus the TOTP seed, independent of the shared master key. Both secrets ' +
+      'are automatically backed up under ~/.claude/vault-mcp-backups/ (never in this repo) alongside the primary ' +
+      'copy. Returns the new vault key ONCE — note it down if you may need to set this up on another machine.',
     inputSchema: {
       type: 'object',
       properties: { projectDir: { type: 'string' } },
@@ -1170,10 +1174,9 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
           totpSeedBase32,
           totpUri,
           vaultKeyHex,
-          backupWarning: 'BACK BOTH totpSeedBase32 AND vaultKeyHex UP NOW as two separate secrets (e.g. as two note ' +
-            'items in a Bitwarden vault — never commit them to this repo). Both are shown only once. Either one ' +
-            'alone is insufficient; losing either one on every machine makes this committed vault permanently ' +
-            'undecryptable.',
+          backupInfo: 'Both secrets were written to ~/.config/vault-mcp/projects/ AND redundantly backed up under ' +
+            '~/.claude/vault-mcp-backups/ on this machine (never in this repo, never in Bitwarden). Shown here ' +
+            'ONCE — note them down only if you plan to set this project vault up on another machine too.',
         } : {}),
       };
     }
@@ -1195,8 +1198,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
         message: `TOTP enabled for project vault "${info.name}".`,
         totpSeedBase32,
         totpUri,
-        totpWarning: 'BACK THIS SEED UP NOW (e.g. as a note item in a Bitwarden vault). It is shown only once. ' +
-          'Without it, this vault becomes permanently undecryptable if this machine is lost.',
+        totpInfo: 'Shown here ONCE — this vault is not committed storage yet, so no ~/.claude backup has been made ' +
+          'for it. Note the seed down only if you plan to set this project vault up on another machine too.',
       };
     }
 
@@ -1209,9 +1212,10 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
         message: `Project vault "${info.name}" moved to committable storage.`,
         vaultFile: `${projectDir}/.vault-project.enc`,
         vaultKeyHex,
-        backupWarning: 'BACK vaultKeyHex UP NOW (e.g. as a note item in a Bitwarden vault — never commit it to ' +
-          'this repo). It is shown only once. Decryption now requires this dedicated vault key AND the TOTP seed ' +
-          '— this machine\'s shared master key is no longer used for this vault at all.',
+        backupInfo: 'This vault key (plus the existing TOTP seed) was written to ~/.config/vault-mcp/projects/ AND ' +
+          'redundantly backed up under ~/.claude/vault-mcp-backups/ on this machine (never in this repo, never in ' +
+          'Bitwarden). Shown here ONCE — decryption now requires this dedicated vault key AND the TOTP seed; this ' +
+          'machine\'s shared master key plays no role for this vault at all anymore.',
         note: 'Both .vault-project and .vault-project.enc are now safe to commit and push.',
       };
     }

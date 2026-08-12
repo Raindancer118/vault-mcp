@@ -13,7 +13,7 @@ import {
 } from 'fs';
 import { join, resolve as resolvePath } from 'path';
 import { randomBytes, createCipheriv, createDecipheriv, hkdfSync } from 'crypto';
-import { getProjectsDir, ensureConfigDirs } from '../config/loader.js';
+import { getProjectsDir, getClaudeBackupsDir, ensureConfigDirs } from '../config/loader.js';
 import { generateTotpSecret, totpUri } from '../tools/totp.js';
 
 const MARKER_FILENAME = '.vault-project';
@@ -141,18 +141,53 @@ function writeTotpSecret(projectId: string, secretBase32: string): void {
   writeFileSync(totpSecretPath(projectId), JSON.stringify({ secretBase32 }, null, 2), { mode: 0o600 });
 }
 
+/**
+ * Redundant local-only backup of a committed vault's secrets, under Claude Code's own
+ * per-user config dir (~/.claude/vault-mcp-backups/<id>.json) — never in the repo,
+ * never synced. Purely a second copy on the same machine's filesystem: if
+ * ~/.config/vault-mcp/projects/<id>.{key,totp} ever gets wiped (config reset,
+ * accidental delete, ...), the committed vault still decrypts automatically, no
+ * manual restore step needed. See requireTotpSeed / requireVaultKey below.
+ */
+interface CommittedSecretsBackup {
+  vaultKeyHex?: string;
+  totpSeedBase32?: string;
+}
+
+function backupPath(projectId: string): string {
+  return join(getClaudeBackupsDir(), `${projectId}.json`);
+}
+
+function readBackup(projectId: string): CommittedSecretsBackup | null {
+  const p = backupPath(projectId);
+  if (!existsSync(p)) return null;
+  return JSON.parse(readFileSync(p, 'utf-8')) as CommittedSecretsBackup;
+}
+
+function writeCommittedSecretsBackup(projectId: string, secrets: CommittedSecretsBackup): void {
+  ensureConfigDirs();
+  const merged = { ...readBackup(projectId), ...secrets };
+  writeFileSync(backupPath(projectId), JSON.stringify(merged, null, 2), { mode: 0o600 });
+}
+
 function requireTotpSeed(projectId: string): string {
   const p = totpSecretPath(projectId);
-  if (!existsSync(p)) {
-    throw new Error(
-      `This project vault requires a local TOTP seed that is missing on this machine (expected at ${p}). ` +
-      'It cannot be decrypted here without it. If you backed up the seed (e.g. as an item in a Bitwarden vault), ' +
-      'restore that JSON file to the path above. Otherwise the vault is unrecoverable — you would need to ' +
-      'delete .vault-project(.enc) and start over.',
-    );
+  if (existsSync(p)) {
+    return (JSON.parse(readFileSync(p, 'utf-8')) as { secretBase32: string }).secretBase32;
   }
-  const data = JSON.parse(readFileSync(p, 'utf-8')) as { secretBase32: string };
-  return data.secretBase32;
+
+  const backup = readBackup(projectId);
+  if (backup?.totpSeedBase32) {
+    writeTotpSecret(projectId, backup.totpSeedBase32); // self-heal the primary copy for next time
+    return backup.totpSeedBase32;
+  }
+
+  throw new Error(
+    `This project vault requires a local TOTP seed that is missing on this machine (expected at ${p}, and no ` +
+    `backup found at ${backupPath(projectId)} either). It cannot be decrypted here without it. If you have a ` +
+    'backup elsewhere, restore that JSON file to one of the paths above. Otherwise the vault is unrecoverable — ' +
+    'you would need to delete .vault-project(.enc) and start over.',
+  );
 }
 
 function vaultKeyFilePath(projectId: string): string {
@@ -170,17 +205,23 @@ function writeVaultKey(projectId: string, vaultKeyHex: string): void {
 
 function requireVaultKey(projectId: string): string {
   const p = vaultKeyFilePath(projectId);
-  if (!existsSync(p)) {
-    throw new Error(
-      `This committed project vault requires a local dedicated vault key that is missing on this machine ` +
-      `(expected at ${p}). It cannot be decrypted here without it — the shared master key is not sufficient ` +
-      'for committed vaults by design. If you backed up the key (e.g. as an item in a Bitwarden vault), restore ' +
-      'that JSON file to the path above. Otherwise the vault is unrecoverable — you would need to delete ' +
-      '.vault-project(.enc) and start over.',
-    );
+  if (existsSync(p)) {
+    return (JSON.parse(readFileSync(p, 'utf-8')) as { vaultKeyHex: string }).vaultKeyHex;
   }
-  const data = JSON.parse(readFileSync(p, 'utf-8')) as { vaultKeyHex: string };
-  return data.vaultKeyHex;
+
+  const backup = readBackup(projectId);
+  if (backup?.vaultKeyHex) {
+    writeVaultKey(projectId, backup.vaultKeyHex); // self-heal the primary copy for next time
+    return backup.vaultKeyHex;
+  }
+
+  throw new Error(
+    `This committed project vault requires a local dedicated vault key that is missing on this machine ` +
+    `(expected at ${p}, and no backup found at ${backupPath(projectId)} either). It cannot be decrypted here ` +
+    'without it — the shared master key is not sufficient for committed vaults by design. If you have a backup ' +
+    'elsewhere, restore that JSON file to one of the paths above. Otherwise the vault is unrecoverable — you ' +
+    'would need to delete .vault-project(.enc) and start over.',
+  );
 }
 
 function markerPath(projectDir: string): string {
@@ -268,6 +309,7 @@ export function initProjectVault(
     writeTotpSecret(marker.id, totpSeedBase32);
     vaultKeyHex = generateVaultKey();
     writeVaultKey(marker.id, vaultKeyHex);
+    writeCommittedSecretsBackup(marker.id, { totpSeedBase32, vaultKeyHex });
   }
 
   writeMarker(projectDir, marker);
@@ -317,6 +359,7 @@ export function enableCommitStorage(masterKey: string, projectDir: string): Enab
 
   const vaultKeyHex = generateVaultKey();
   writeVaultKey(marker.id, vaultKeyHex);
+  writeCommittedSecretsBackup(marker.id, { vaultKeyHex, totpSeedBase32: requireTotpSeed(marker.id) });
 
   const updated: VaultMarker = { ...marker, storage: 'committed' };
   saveVault(masterKey, projectDir, updated, data); // re-encrypt under the new committed scheme
