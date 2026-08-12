@@ -1,0 +1,148 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { randomBytes } from 'crypto';
+import {
+  initProjectVault, getProjectInfo, listProjectItems, createProjectItem,
+  updateProjectItem, deleteProjectItem, resolveProjectValue,
+  enableTotp, enableCommitStorage,
+} from './project-vault.js';
+import { getProjectsDir } from '../config/loader.js';
+
+const MASTER_KEY = randomBytes(32).toString('hex');
+
+describe('project-vault', () => {
+  let configDir: string;
+  let projectDir: string;
+
+  beforeEach(() => {
+    configDir = mkdtempSync(join(tmpdir(), 'vault-mcp-config-'));
+    projectDir = mkdtempSync(join(tmpdir(), 'vault-mcp-project-'));
+    process.env.VAULT_MCP_CONFIG_DIR = configDir;
+  });
+
+  afterEach(() => {
+    delete process.env.VAULT_MCP_CONFIG_DIR;
+    rmSync(configDir, { recursive: true, force: true });
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  describe('external storage (default, unchanged behaviour)', () => {
+    it('stores the vault outside the project dir and requires no TOTP', () => {
+      const { marker, totpSeedBase32 } = initProjectVault(MASTER_KEY, projectDir, 'demo');
+      expect(marker.storage).toBe('external');
+      expect(marker.totpEnabled).toBe(false);
+      expect(totpSeedBase32).toBeUndefined();
+      expect(existsSync(join(projectDir, '.vault-project.enc'))).toBe(false);
+      expect(existsSync(join(getProjectsDir(), `${marker.id}.vault`))).toBe(true);
+    });
+
+    it('supports full CRUD without a TOTP code', () => {
+      initProjectVault(MASTER_KEY, projectDir, 'demo');
+      const created = createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
+      expect(listProjectItems(MASTER_KEY, projectDir).map(i => i.name)).toEqual(['npmpass']);
+      expect(resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toBe('s3cr3t-value');
+      updateProjectItem(MASTER_KEY, projectDir, created.id, 'new-value');
+      expect(resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toBe('new-value');
+      deleteProjectItem(MASTER_KEY, projectDir, created.id);
+      expect(listProjectItems(MASTER_KEY, projectDir)).toHaveLength(0);
+    });
+  });
+
+  describe('committed storage (commit: true)', () => {
+    it('writes the encrypted vault inside the project dir and forces TOTP on', () => {
+      const { marker, totpSeedBase32, totpUri } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+      expect(marker.storage).toBe('committed');
+      expect(marker.totpEnabled).toBe(true);
+      expect(totpSeedBase32).toMatch(/^[A-Z2-7]+$/);
+      expect(totpUri).toContain('otpauth://totp/');
+      expect(existsSync(join(projectDir, '.vault-project.enc'))).toBe(true);
+      expect(existsSync(join(getProjectsDir(), `${marker.id}.vault`))).toBe(false);
+    });
+
+    it('never writes the TOTP seed anywhere under the project dir', () => {
+      initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+      const projectFiles = [join(projectDir, '.vault-project'), join(projectDir, '.vault-project.enc')];
+      for (const f of projectFiles) {
+        expect(readFileSync(f, 'utf-8')).not.toMatch(/[A-Z2-7]{20,}/);
+      }
+    });
+
+    it('supports full CRUD transparently, reading the local TOTP seed automatically', () => {
+      initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+      createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
+      expect(resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toBe('s3cr3t-value');
+    });
+
+    it('throws a clear error when the local TOTP seed file is missing', () => {
+      const { marker } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+      createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
+      rmSync(join(getProjectsDir(), `${marker.id}.totp`));
+      expect(() => resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toThrow(/TOTP seed/);
+    });
+
+    it('cannot be decrypted with the master key alone (TOTP seed is load-bearing for the key, not just a gate)', () => {
+      const { marker } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+      createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
+      // Simulate an attacker who has the ciphertext + master key but not the local TOTP seed file.
+      rmSync(join(getProjectsDir(), `${marker.id}.totp`));
+      expect(() => listProjectItems(MASTER_KEY, projectDir)).toThrow();
+    });
+  });
+
+  describe('enableTotp — upgrading an existing external vault', () => {
+    it('adds a TOTP seed and keeps existing items readable afterwards', () => {
+      initProjectVault(MASTER_KEY, projectDir, 'demo');
+      createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
+
+      const { totpSeedBase32 } = enableTotp(MASTER_KEY, projectDir);
+      expect(totpSeedBase32).toMatch(/^[A-Z2-7]+$/);
+
+      const info = getProjectInfo(projectDir)!;
+      expect(info.totpEnabled).toBe(true);
+      expect(resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toBe('s3cr3t-value');
+    });
+
+    it('refuses to enable TOTP twice', () => {
+      initProjectVault(MASTER_KEY, projectDir, 'demo');
+      enableTotp(MASTER_KEY, projectDir);
+      expect(() => enableTotp(MASTER_KEY, projectDir)).toThrow(/already enabled/);
+    });
+  });
+
+  describe('enableCommitStorage — moving an external vault into the repo', () => {
+    it('requires TOTP to already be enabled', () => {
+      initProjectVault(MASTER_KEY, projectDir, 'demo');
+      expect(() => enableCommitStorage(projectDir)).toThrow(/TOTP/);
+    });
+
+    it('moves the ciphertext into the project dir once TOTP is enabled, preserving items', () => {
+      const { marker } = initProjectVault(MASTER_KEY, projectDir, 'demo');
+      createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
+      enableTotp(MASTER_KEY, projectDir);
+
+      enableCommitStorage(projectDir);
+
+      const info = getProjectInfo(projectDir)!;
+      expect(info.storage).toBe('committed');
+      expect(existsSync(join(projectDir, '.vault-project.enc'))).toBe(true);
+      expect(existsSync(join(getProjectsDir(), `${marker.id}.vault`))).toBe(false);
+      expect(resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toBe('s3cr3t-value');
+    });
+  });
+
+  describe('backward compatibility with pre-existing (legacy) markers', () => {
+    it('treats a marker without storage/totpEnabled fields as external, non-TOTP', () => {
+      const legacyMarker = { id: crypto.randomUUID(), name: 'legacy', createdAt: new Date().toISOString() };
+      writeFileSync(join(projectDir, '.vault-project'), JSON.stringify(legacyMarker, null, 2));
+
+      const info = getProjectInfo(projectDir)!;
+      expect(info.storage).toBe('external');
+      expect(info.totpEnabled).toBe(false);
+
+      createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
+      expect(resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toBe('s3cr3t-value');
+    });
+  });
+});

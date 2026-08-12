@@ -476,19 +476,58 @@ const TOOLS: Tool[] = [
   // ── Project vault setup ───────────────────────────────────────────────────────
   {
     name: 'vault_init_project',
-    description: 'Initialise a project vault for a Git repository. Creates a .vault-project marker file (safe to commit) and an AES-256-GCM encrypted vault.',
+    description:
+      'Initialise a project vault for a Git repository. Creates a .vault-project marker file (safe to commit) ' +
+      'and an AES-256-GCM encrypted vault.\n\n' +
+      'By default (commit: false) the encrypted vault is stored OUTSIDE the repo, under this machine\'s ' +
+      'vault-mcp config dir — nothing but the marker is ever committed.\n\n' +
+      'Pass commit: true to store the encrypted vault file itself inside the repo (as .vault-project.enc) so it ' +
+      'can be committed and pushed alongside the code. This forces TOTP protection on: the encryption key is ' +
+      'then derived from BOTH this machine\'s master key AND a locally-stored TOTP seed, so the pushed ciphertext ' +
+      'alone (or even ciphertext + a stolen master key) is not enough to decrypt it — every machine that needs to ' +
+      'use the vault needs its own copy of the local TOTP seed file too. The response includes the TOTP seed and ' +
+      'an otpauth:// URI ONCE — back the seed up immediately (e.g. as a note in a Bitwarden vault) or the ' +
+      'committed vault becomes unrecoverable if this machine is lost.',
     inputSchema: {
       type: 'object',
       properties: {
         projectDir: { type: 'string', description: 'Absolute path to the project root.' },
         name: { type: 'string', description: 'Human-readable project name.' },
+        commit: {
+          type: 'boolean',
+          description: 'Store the encrypted vault inside the repo (committable) instead of in local machine config. Forces TOTP on. Default: false.',
+        },
       },
       required: ['projectDir', 'name'],
     },
   },
   {
     name: 'vault_project_info',
-    description: 'Get info about a project vault (name, ID, item count). No values returned.',
+    description: 'Get info about a project vault (name, ID, item count, storage mode, TOTP status). No values returned.',
+    inputSchema: {
+      type: 'object',
+      properties: { projectDir: { type: 'string' } },
+      required: ['projectDir'],
+    },
+  },
+  {
+    name: 'vault_project_totp_enable',
+    description:
+      'Enable TOTP protection on an existing project vault that was created without it. Re-encrypts the vault ' +
+      'under a key derived from both the master key and a newly generated local TOTP seed. Required before ' +
+      'vault_project_enable_commit_storage. Returns the TOTP seed and otpauth:// URI ONCE — back it up immediately.',
+    inputSchema: {
+      type: 'object',
+      properties: { projectDir: { type: 'string' } },
+      required: ['projectDir'],
+    },
+  },
+  {
+    name: 'vault_project_enable_commit_storage',
+    description:
+      'Move an existing project vault\'s encrypted file from local machine config into the repo (as ' +
+      '.vault-project.enc) so it can be committed and pushed. Requires TOTP to already be enabled ' +
+      '(run vault_project_totp_enable first) — refuses otherwise.',
     inputSchema: {
       type: 'object',
       properties: { projectDir: { type: 'string' } },
@@ -1101,15 +1140,26 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
     // ── Project vault setup ──────────────────────────────────────────────────
 
     case 'vault_init_project': {
-      const { projectDir, name: projectName } = args as { projectDir: string; name: string };
-      const marker = pv.initProjectVault(cfg.masterKey, projectDir, projectName);
-      auditLog('init_project', 'project', marker.id, { dir: projectDir });
+      const { projectDir, name: projectName, commit } = args as { projectDir: string; name: string; commit?: boolean };
+      const { marker, totpSeedBase32, totpUri } = pv.initProjectVault(cfg.masterKey, projectDir, projectName, { commit });
+      auditLog('init_project', 'project', marker.id, { dir: projectDir, storage: marker.storage });
       return {
         message: 'Project vault initialised.',
         id: marker.id,
         name: marker.name,
+        storage: marker.storage,
+        totpEnabled: marker.totpEnabled,
         markerFile: `${projectDir}/.vault-project`,
-        note: '.vault-project is safe to commit — it contains only a UUID.',
+        vaultFile: marker.storage === 'committed' ? `${projectDir}/.vault-project.enc` : undefined,
+        note: marker.storage === 'committed'
+          ? '.vault-project and .vault-project.enc are both safe to commit — the ciphertext cannot be decrypted without this machine\'s master key AND the TOTP seed below.'
+          : '.vault-project is safe to commit — it contains only a UUID. The encrypted vault itself stays local to this machine.',
+        ...(totpSeedBase32 ? {
+          totpSeedBase32,
+          totpUri,
+          totpWarning: 'BACK THIS SEED UP NOW (e.g. as a note item in a Bitwarden vault). It is shown only once. ' +
+            'Without it, this committed vault becomes permanently undecryptable if this machine is lost.',
+        } : {}),
       };
     }
 
@@ -1119,6 +1169,32 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
       if (!info) return `No project vault at "${projectDir}".`;
       const items = pv.listProjectItems(cfg.masterKey, projectDir);
       return { ...info, itemCount: items.length };
+    }
+
+    case 'vault_project_totp_enable': {
+      const { projectDir } = args as { projectDir: string };
+      const { totpSeedBase32, totpUri } = pv.enableTotp(cfg.masterKey, projectDir);
+      const info = pv.getProjectInfo(projectDir)!;
+      auditLog('project_totp_enable', 'project', info.id);
+      return {
+        message: `TOTP enabled for project vault "${info.name}".`,
+        totpSeedBase32,
+        totpUri,
+        totpWarning: 'BACK THIS SEED UP NOW (e.g. as a note item in a Bitwarden vault). It is shown only once. ' +
+          'Without it, this vault becomes permanently undecryptable if this machine is lost.',
+      };
+    }
+
+    case 'vault_project_enable_commit_storage': {
+      const { projectDir } = args as { projectDir: string };
+      pv.enableCommitStorage(projectDir);
+      const info = pv.getProjectInfo(projectDir)!;
+      auditLog('project_enable_commit_storage', 'project', info.id);
+      return {
+        message: `Project vault "${info.name}" moved to committable storage.`,
+        vaultFile: `${projectDir}/.vault-project.enc`,
+        note: 'Both .vault-project and .vault-project.enc are now safe to commit and push.',
+      };
     }
 
     // ── Project vault item management ────────────────────────────────────────
