@@ -477,17 +477,22 @@ const TOOLS: Tool[] = [
   {
     name: 'vault_init_project',
     description:
-      'Initialise a project vault for a Git repository. Creates a .vault-project marker file (safe to commit) ' +
-      'and an AES-256-GCM encrypted vault.\n\n' +
+      'Initialise a project vault for a Git repository — a small LOCAL secret store meant to hold ONLY the ' +
+      'handful of secrets this specific repo actually needs at runtime. This is NOT a copy of, sync of, or ' +
+      'export from any Bitwarden/Vaultwarden vault — a full Bitwarden/Vaultwarden vault (personal or org) must ' +
+      'NEVER be committed or pushed. Add items one at a time via vault_project_create_item, only ones this repo ' +
+      'genuinely uses.\n\n' +
+      'Creates a .vault-project marker file (safe to commit) and an AES-256-GCM encrypted vault.\n\n' +
       'By default (commit: false) the encrypted vault is stored OUTSIDE the repo, under this machine\'s ' +
       'vault-mcp config dir — nothing but the marker is ever committed.\n\n' +
       'Pass commit: true to store the encrypted vault file itself inside the repo (as .vault-project.enc) so it ' +
-      'can be committed and pushed alongside the code. This forces TOTP protection on: the encryption key is ' +
-      'then derived from BOTH this machine\'s master key AND a locally-stored TOTP seed, so the pushed ciphertext ' +
-      'alone (or even ciphertext + a stolen master key) is not enough to decrypt it — every machine that needs to ' +
-      'use the vault needs its own copy of the local TOTP seed file too. The response includes the TOTP seed and ' +
-      'an otpauth:// URI ONCE — back the seed up immediately (e.g. as a note in a Bitwarden vault) or the ' +
-      'committed vault becomes unrecoverable if this machine is lost.',
+      'can be committed and pushed alongside the code. This forces TOTP protection on, AND mints a dedicated, ' +
+      'single-purpose 512-bit vault key — both stored only locally, never in the repo, and both required together ' +
+      'to decrypt. Deliberately independent of this machine\'s shared master key: leaking the master key (shared ' +
+      'across every vault on this machine) has zero effect on a committed vault. Every machine that needs to use ' +
+      'the vault needs its own local copy of BOTH files. The response includes the vault key and TOTP seed ONCE — ' +
+      'back both up immediately as separate items (e.g. two notes in a Bitwarden vault, never in this repo) or the ' +
+      'committed vault becomes permanently unrecoverable if this machine is lost.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -495,7 +500,7 @@ const TOOLS: Tool[] = [
         name: { type: 'string', description: 'Human-readable project name.' },
         commit: {
           type: 'boolean',
-          description: 'Store the encrypted vault inside the repo (committable) instead of in local machine config. Forces TOTP on. Default: false.',
+          description: 'Store the encrypted vault inside the repo (committable) instead of in local machine config. Forces TOTP + a dedicated vault key on. Default: false.',
         },
       },
       required: ['projectDir', 'name'],
@@ -527,7 +532,9 @@ const TOOLS: Tool[] = [
     description:
       'Move an existing project vault\'s encrypted file from local machine config into the repo (as ' +
       '.vault-project.enc) so it can be committed and pushed. Requires TOTP to already be enabled ' +
-      '(run vault_project_totp_enable first) — refuses otherwise.',
+      '(run vault_project_totp_enable first) — refuses otherwise. Mints a brand-new dedicated 512-bit vault key ' +
+      'and re-encrypts everything under it plus the TOTP seed, independent of the shared master key. Returns the ' +
+      'new vault key ONCE — back it up immediately (e.g. as a note in a Bitwarden vault, never in this repo).',
     inputSchema: {
       type: 'object',
       properties: { projectDir: { type: 'string' } },
@@ -547,7 +554,10 @@ const TOOLS: Tool[] = [
   },
   {
     name: 'vault_project_create_item',
-    description: 'Create a new item in a project vault. Claude must provide the value. Requires confirmed=true.',
+    description:
+      'Create a new item in a project vault. Claude must provide the value. Requires confirmed=true. ' +
+      'Add items ONE AT A TIME, and only ones this repo genuinely needs at runtime — never bulk-import or mirror ' +
+      'an entire Bitwarden/Vaultwarden vault into a project vault.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1141,7 +1151,7 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
 
     case 'vault_init_project': {
       const { projectDir, name: projectName, commit } = args as { projectDir: string; name: string; commit?: boolean };
-      const { marker, totpSeedBase32, totpUri } = pv.initProjectVault(cfg.masterKey, projectDir, projectName, { commit });
+      const { marker, totpSeedBase32, totpUri, vaultKeyHex } = pv.initProjectVault(cfg.masterKey, projectDir, projectName, { commit });
       auditLog('init_project', 'project', marker.id, { dir: projectDir, storage: marker.storage });
       return {
         message: 'Project vault initialised.',
@@ -1152,13 +1162,18 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
         markerFile: `${projectDir}/.vault-project`,
         vaultFile: marker.storage === 'committed' ? `${projectDir}/.vault-project.enc` : undefined,
         note: marker.storage === 'committed'
-          ? '.vault-project and .vault-project.enc are both safe to commit — the ciphertext cannot be decrypted without this machine\'s master key AND the TOTP seed below.'
+          ? '.vault-project and .vault-project.enc are both safe to commit — decryption requires the dedicated ' +
+            'vault key AND the TOTP seed below, both local to this machine. This machine\'s shared master key plays ' +
+            'no role for committed vaults at all.'
           : '.vault-project is safe to commit — it contains only a UUID. The encrypted vault itself stays local to this machine.',
-        ...(totpSeedBase32 ? {
+        ...(totpSeedBase32 && vaultKeyHex ? {
           totpSeedBase32,
           totpUri,
-          totpWarning: 'BACK THIS SEED UP NOW (e.g. as a note item in a Bitwarden vault). It is shown only once. ' +
-            'Without it, this committed vault becomes permanently undecryptable if this machine is lost.',
+          vaultKeyHex,
+          backupWarning: 'BACK BOTH totpSeedBase32 AND vaultKeyHex UP NOW as two separate secrets (e.g. as two note ' +
+            'items in a Bitwarden vault — never commit them to this repo). Both are shown only once. Either one ' +
+            'alone is insufficient; losing either one on every machine makes this committed vault permanently ' +
+            'undecryptable.',
         } : {}),
       };
     }
@@ -1187,12 +1202,16 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
 
     case 'vault_project_enable_commit_storage': {
       const { projectDir } = args as { projectDir: string };
-      pv.enableCommitStorage(projectDir);
+      const { vaultKeyHex } = pv.enableCommitStorage(cfg.masterKey, projectDir);
       const info = pv.getProjectInfo(projectDir)!;
       auditLog('project_enable_commit_storage', 'project', info.id);
       return {
         message: `Project vault "${info.name}" moved to committable storage.`,
         vaultFile: `${projectDir}/.vault-project.enc`,
+        vaultKeyHex,
+        backupWarning: 'BACK vaultKeyHex UP NOW (e.g. as a note item in a Bitwarden vault — never commit it to ' +
+          'this repo). It is shown only once. Decryption now requires this dedicated vault key AND the TOTP seed ' +
+          '— this machine\'s shared master key is no longer used for this vault at all.',
         note: 'Both .vault-project and .vault-project.enc are now safe to commit and push.',
       };
     }

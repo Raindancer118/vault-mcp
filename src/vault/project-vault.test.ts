@@ -11,6 +11,7 @@ import {
 import { getProjectsDir } from '../config/loader.js';
 
 const MASTER_KEY = randomBytes(32).toString('hex');
+const OTHER_MASTER_KEY = randomBytes(32).toString('hex');
 
 describe('project-vault', () => {
   let configDir: string;
@@ -30,10 +31,11 @@ describe('project-vault', () => {
 
   describe('external storage (default, unchanged behaviour)', () => {
     it('stores the vault outside the project dir and requires no TOTP', () => {
-      const { marker, totpSeedBase32 } = initProjectVault(MASTER_KEY, projectDir, 'demo');
+      const { marker, totpSeedBase32, vaultKeyHex } = initProjectVault(MASTER_KEY, projectDir, 'demo');
       expect(marker.storage).toBe('external');
       expect(marker.totpEnabled).toBe(false);
       expect(totpSeedBase32).toBeUndefined();
+      expect(vaultKeyHex).toBeUndefined();
       expect(existsSync(join(projectDir, '.vault-project.enc'))).toBe(false);
       expect(existsSync(join(getProjectsDir(), `${marker.id}.vault`))).toBe(true);
     });
@@ -50,29 +52,40 @@ describe('project-vault', () => {
     });
   });
 
-  describe('committed storage (commit: true)', () => {
-    it('writes the encrypted vault inside the project dir and forces TOTP on', () => {
-      const { marker, totpSeedBase32, totpUri } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+  describe('committed storage (commit: true) — dedicated vault key + TOTP, independent of the shared master key', () => {
+    it('writes the encrypted vault inside the project dir, forces TOTP on, and hands out a dedicated 512-bit vault key', () => {
+      const { marker, totpSeedBase32, totpUri, vaultKeyHex } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
       expect(marker.storage).toBe('committed');
       expect(marker.totpEnabled).toBe(true);
       expect(totpSeedBase32).toMatch(/^[A-Z2-7]+$/);
       expect(totpUri).toContain('otpauth://totp/');
+      expect(vaultKeyHex).toMatch(/^[0-9a-f]{128}$/); // 64 bytes = 512 bits
       expect(existsSync(join(projectDir, '.vault-project.enc'))).toBe(true);
       expect(existsSync(join(getProjectsDir(), `${marker.id}.vault`))).toBe(false);
     });
 
-    it('never writes the TOTP seed anywhere under the project dir', () => {
+    it('never writes the TOTP seed or the vault key anywhere under the project dir', () => {
       initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
       const projectFiles = [join(projectDir, '.vault-project'), join(projectDir, '.vault-project.enc')];
       for (const f of projectFiles) {
-        expect(readFileSync(f, 'utf-8')).not.toMatch(/[A-Z2-7]{20,}/);
+        const content = readFileSync(f, 'utf-8');
+        expect(content).not.toMatch(/[A-Z2-7]{20,}/); // no base32 TOTP seed
+        expect(content).not.toMatch(/[0-9a-f]{100,}/); // no hex vault key
       }
     });
 
-    it('supports full CRUD transparently, reading the local TOTP seed automatically', () => {
+    it('supports full CRUD transparently, reading the local TOTP seed and vault key automatically', () => {
       initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
       createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
       expect(resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toBe('s3cr3t-value');
+    });
+
+    it('is completely independent of the machine master key — decrypts fine even with a totally different one', () => {
+      initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+      createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
+      expect(resolveProjectValue(OTHER_MASTER_KEY, projectDir, 'npmpass')).toBe('s3cr3t-value');
+      createProjectItem(OTHER_MASTER_KEY, projectDir, 'second', 'another-value');
+      expect(resolveProjectValue(MASTER_KEY, projectDir, 'second')).toBe('another-value');
     });
 
     it('throws a clear error when the local TOTP seed file is missing', () => {
@@ -82,11 +95,24 @@ describe('project-vault', () => {
       expect(() => resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toThrow(/TOTP seed/);
     });
 
-    it('cannot be decrypted with the master key alone (TOTP seed is load-bearing for the key, not just a gate)', () => {
+    it('throws a clear error when the local dedicated vault key file is missing, even with the TOTP seed intact', () => {
       const { marker } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
       createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
-      // Simulate an attacker who has the ciphertext + master key but not the local TOTP seed file.
+      rmSync(join(getProjectsDir(), `${marker.id}.key`));
+      expect(() => resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toThrow(/vault key/);
+    });
+
+    it('cannot be decrypted with the master key alone if the TOTP seed is missing (master key plays no role here at all)', () => {
+      const { marker } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+      createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
       rmSync(join(getProjectsDir(), `${marker.id}.totp`));
+      expect(() => listProjectItems(MASTER_KEY, projectDir)).toThrow();
+    });
+
+    it('cannot be decrypted with only the TOTP seed if the dedicated vault key is missing', () => {
+      const { marker } = initProjectVault(MASTER_KEY, projectDir, 'demo', { commit: true });
+      createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
+      rmSync(join(getProjectsDir(), `${marker.id}.key`));
       expect(() => listProjectItems(MASTER_KEY, projectDir)).toThrow();
     });
   });
@@ -111,24 +137,34 @@ describe('project-vault', () => {
     });
   });
 
-  describe('enableCommitStorage — moving an external vault into the repo', () => {
+  describe('enableCommitStorage — moving an external vault into the repo, minting a dedicated vault key', () => {
     it('requires TOTP to already be enabled', () => {
       initProjectVault(MASTER_KEY, projectDir, 'demo');
-      expect(() => enableCommitStorage(projectDir)).toThrow(/TOTP/);
+      expect(() => enableCommitStorage(MASTER_KEY, projectDir)).toThrow(/TOTP/);
     });
 
-    it('moves the ciphertext into the project dir once TOTP is enabled, preserving items', () => {
+    it('moves the ciphertext into the project dir once TOTP is enabled, mints a vault key, and preserves items', () => {
       const { marker } = initProjectVault(MASTER_KEY, projectDir, 'demo');
       createProjectItem(MASTER_KEY, projectDir, 'npmpass', 's3cr3t-value');
       enableTotp(MASTER_KEY, projectDir);
 
-      enableCommitStorage(projectDir);
+      const { vaultKeyHex } = enableCommitStorage(MASTER_KEY, projectDir);
 
+      expect(vaultKeyHex).toMatch(/^[0-9a-f]{128}$/);
       const info = getProjectInfo(projectDir)!;
       expect(info.storage).toBe('committed');
       expect(existsSync(join(projectDir, '.vault-project.enc'))).toBe(true);
       expect(existsSync(join(getProjectsDir(), `${marker.id}.vault`))).toBe(false);
       expect(resolveProjectValue(MASTER_KEY, projectDir, 'npmpass')).toBe('s3cr3t-value');
+      // Now fully independent of the master key, same as a from-the-start committed vault.
+      expect(resolveProjectValue(OTHER_MASTER_KEY, projectDir, 'npmpass')).toBe('s3cr3t-value');
+    });
+
+    it('refuses to run twice on an already-committed vault', () => {
+      initProjectVault(MASTER_KEY, projectDir, 'demo');
+      enableTotp(MASTER_KEY, projectDir);
+      enableCommitStorage(MASTER_KEY, projectDir);
+      expect(() => enableCommitStorage(MASTER_KEY, projectDir)).toThrow(/already/i);
     });
   });
 

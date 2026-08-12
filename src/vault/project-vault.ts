@@ -1,3 +1,13 @@
+/**
+ * Local, per-project secret store — deliberately unrelated to any Bitwarden/
+ * Vaultwarden vault. It never mirrors, syncs, or exports a remote vault: items
+ * only ever get in here one at a time, via an explicit vault_project_create_item
+ * call, and are meant to hold ONLY the handful of secrets a given repo actually
+ * needs at runtime (an API key for CI, a deploy token, ...). A full Bitwarden/
+ * Vaultwarden vault (personal or org) must NEVER be committed or pushed — if you
+ * need something from one, copy just that one value across via create_item.
+ */
+
 import {
   readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync,
 } from 'fs';
@@ -49,9 +59,10 @@ export interface ProjectItemMeta {
 
 export interface InitProjectResult {
   marker: VaultMarker;
-  /** Only present when a TOTP seed was just generated (commit: true). Shown once — back it up now. */
+  /** Only present when the vault was just created as committed. Shown once — back both up now. */
   totpSeedBase32?: string;
   totpUri?: string;
+  vaultKeyHex?: string;
 }
 
 export interface EnableTotpResult {
@@ -59,18 +70,17 @@ export interface EnableTotpResult {
   totpUri: string;
 }
 
+export interface EnableCommitResult {
+  vaultKeyHex: string;
+}
+
 // ─── Crypto ───────────────────────────────────────────────────────────────────
 
 /**
- * With no TOTP seed: unchanged v1 scheme (master key only).
- * With a TOTP seed: the seed is folded into the HKDF input keying material alongside
- * the master key, under a distinct info string, so the vault is a genuinely different
- * key — not just an extra check layered on top. Ciphertext + master key alone is not
- * enough; the local TOTP seed file is equally load-bearing. We use the static seed
- * (not the rotating 6-digit code) because the code changing every 30s cannot gate a
- * persistent ciphertext without making it undecryptable a minute later — the seed is
- * what actually has to survive across time, and it's exactly what an agent can read
- * and use automatically without any human typing a code.
+ * External storage (default, not committed): unchanged from before.
+ * With no TOTP seed: v1 scheme (shared per-machine master key only).
+ * With a TOTP seed (enableTotp on an external vault): the seed is folded into the
+ * HKDF input keying material alongside the master key, under a distinct info string.
  */
 function deriveKey(masterKey: string, projectId: string, totpSeedBase32?: string): Buffer {
   const ikm = totpSeedBase32
@@ -78,6 +88,21 @@ function deriveKey(masterKey: string, projectId: string, totpSeedBase32?: string
     : Buffer.from(masterKey, 'hex');
   const info = totpSeedBase32 ? 'vault-mcp-project-v2-totp' : 'vault-mcp-project-v1';
   return Buffer.from(hkdfSync('sha256', ikm, Buffer.from(projectId, 'utf-8'), info, 32));
+}
+
+/**
+ * Committed storage: intentionally does NOT use the shared per-machine master key at
+ * all. Instead a dedicated, single-purpose, high-entropy "vault key" (512 bits,
+ * generated once per project) plus the TOTP seed are both required and both folded
+ * into the HKDF input keying material. This decouples a pushed vault's security from
+ * the master key entirely — leaking the master key (which every vault on this machine
+ * shares) has zero effect on a committed vault, and either the vault key or the TOTP
+ * seed alone is still insufficient. Both files stay local, never touch the repo, and
+ * both are handed back once (at creation / enableCommitStorage) for backup.
+ */
+function deriveCommittedKey(vaultKeyHex: string, projectId: string, totpSeedBase32: string): Buffer {
+  const ikm = Buffer.concat([Buffer.from(vaultKeyHex, 'hex'), Buffer.from(totpSeedBase32, 'utf-8')]);
+  return Buffer.from(hkdfSync('sha256', ikm, Buffer.from(projectId, 'utf-8'), 'vault-mcp-project-v3-committed', 32));
 }
 
 function encryptVault(key: Buffer, data: ProjectVaultData): Buffer {
@@ -130,6 +155,34 @@ function requireTotpSeed(projectId: string): string {
   return data.secretBase32;
 }
 
+function vaultKeyFilePath(projectId: string): string {
+  return join(getProjectsDir(), `${projectId}.key`);
+}
+
+function generateVaultKey(): string {
+  return randomBytes(64).toString('hex'); // 512 bits — deliberately independent of and much larger than the shared master key.
+}
+
+function writeVaultKey(projectId: string, vaultKeyHex: string): void {
+  ensureConfigDirs();
+  writeFileSync(vaultKeyFilePath(projectId), JSON.stringify({ vaultKeyHex }, null, 2), { mode: 0o600 });
+}
+
+function requireVaultKey(projectId: string): string {
+  const p = vaultKeyFilePath(projectId);
+  if (!existsSync(p)) {
+    throw new Error(
+      `This committed project vault requires a local dedicated vault key that is missing on this machine ` +
+      `(expected at ${p}). It cannot be decrypted here without it — the shared master key is not sufficient ` +
+      'for committed vaults by design. If you backed up the key (e.g. as an item in a Bitwarden vault), restore ' +
+      'that JSON file to the path above. Otherwise the vault is unrecoverable — you would need to delete ' +
+      '.vault-project(.enc) and start over.',
+    );
+  }
+  const data = JSON.parse(readFileSync(p, 'utf-8')) as { vaultKeyHex: string };
+  return data.vaultKeyHex;
+}
+
 function markerPath(projectDir: string): string {
   return join(resolvePath(projectDir), MARKER_FILENAME);
 }
@@ -160,18 +213,31 @@ function requireMarker(projectDir: string): VaultMarker {
   return m;
 }
 
+/**
+ * Picks the right key derivation for a marker's storage mode. Committed vaults are
+ * fully independent of `masterKey` — it is accepted for a uniform call signature
+ * across both storage modes but simply unused once storage === 'committed'.
+ */
+function deriveKeyForMarker(masterKey: string, marker: VaultMarker): Buffer {
+  if (marker.storage === 'committed') {
+    const vaultKeyHex = requireVaultKey(marker.id);
+    const totpSeed = requireTotpSeed(marker.id); // committed always implies totpEnabled
+    return deriveCommittedKey(vaultKeyHex, marker.id, totpSeed);
+  }
+  const totpSeed = marker.totpEnabled ? requireTotpSeed(marker.id) : undefined;
+  return deriveKey(masterKey, marker.id, totpSeed);
+}
+
 function loadVault(masterKey: string, projectDir: string, marker: VaultMarker): ProjectVaultData {
   const p = vaultPath(projectDir, marker);
   if (!existsSync(p)) return { version: VAULT_VERSION, items: [] };
-  const totpSeed = marker.totpEnabled ? requireTotpSeed(marker.id) : undefined;
-  const key = deriveKey(masterKey, marker.id, totpSeed);
+  const key = deriveKeyForMarker(masterKey, marker);
   return decryptVault(key, readFileSync(p));
 }
 
 function saveVault(masterKey: string, projectDir: string, marker: VaultMarker, data: ProjectVaultData): void {
   ensureConfigDirs();
-  const totpSeed = marker.totpEnabled ? requireTotpSeed(marker.id) : undefined;
-  const key = deriveKey(masterKey, marker.id, totpSeed);
+  const key = deriveKeyForMarker(masterKey, marker);
   writeFileSync(vaultPath(projectDir, marker), encryptVault(key, data), { mode: 0o600 });
 }
 
@@ -196,16 +262,19 @@ export function initProjectVault(
   };
 
   let totpSeedBase32: string | undefined;
+  let vaultKeyHex: string | undefined;
   if (commit) {
     totpSeedBase32 = generateTotpSecret();
     writeTotpSecret(marker.id, totpSeedBase32);
+    vaultKeyHex = generateVaultKey();
+    writeVaultKey(marker.id, vaultKeyHex);
   }
 
   writeMarker(projectDir, marker);
   saveVault(masterKey, projectDir, marker, { version: VAULT_VERSION, items: [] });
 
-  return totpSeedBase32
-    ? { marker, totpSeedBase32, totpUri: totpUri(totpSeedBase32, name) }
+  return totpSeedBase32 && vaultKeyHex
+    ? { marker, totpSeedBase32, totpUri: totpUri(totpSeedBase32, name), vaultKeyHex }
     : { marker };
 }
 
@@ -229,22 +298,32 @@ export function enableTotp(masterKey: string, projectDir: string): EnableTotpRes
   return { totpSeedBase32: seed, totpUri: totpUri(seed, marker.name) };
 }
 
-/** Move an external vault's ciphertext into the project dir so it can be committed. Requires TOTP already on. */
-export function enableCommitStorage(projectDir: string): void {
+/**
+ * Move an external vault's ciphertext into the project dir so it can be committed.
+ * Requires TOTP already on. Mints a brand-new dedicated vault key and re-encrypts
+ * under the committed scheme (vault key + TOTP seed, independent of the master key)
+ * — the old external-scheme ciphertext (tied to the shared master key) is never
+ * itself pushed; only the freshly re-encrypted bytes are.
+ */
+export function enableCommitStorage(masterKey: string, projectDir: string): EnableCommitResult {
   const marker = requireMarker(projectDir);
-  if (marker.storage === 'committed') return;
+  if (marker.storage === 'committed') throw new Error('This project vault is already using committed storage.');
   if (!marker.totpEnabled) {
     throw new Error('Enable TOTP first (vault_project_totp_enable) — committed project vaults must be TOTP-protected.');
   }
 
+  const data = loadVault(masterKey, projectDir, marker); // decrypt under the old external (master-key-based) scheme
   const oldPath = vaultPath(projectDir, marker);
-  const updated: VaultMarker = { ...marker, storage: 'committed' };
-  const newPath = vaultPath(projectDir, updated);
 
-  const bytes = readFileSync(oldPath);
-  writeFileSync(newPath, bytes, { mode: 0o600 });
+  const vaultKeyHex = generateVaultKey();
+  writeVaultKey(marker.id, vaultKeyHex);
+
+  const updated: VaultMarker = { ...marker, storage: 'committed' };
+  saveVault(masterKey, projectDir, updated, data); // re-encrypt under the new committed scheme
   writeMarker(projectDir, updated);
   unlinkSync(oldPath);
+
+  return { vaultKeyHex };
 }
 
 export function listProjectItems(masterKey: string, projectDir: string): ProjectItemMeta[] {
