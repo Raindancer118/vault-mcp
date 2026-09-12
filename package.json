@@ -1,6 +1,6 @@
 {
   "name": "vault-mcp",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Secure secrets management MCP server with Vaultwarden and project vault support",
   "type": "module",
   "bin": {

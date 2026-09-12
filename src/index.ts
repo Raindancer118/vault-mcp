@@ -125,8 +125,14 @@ const TOOLS: Tool[] = [
     name: 'vault_search',
     description:
       'Fuzzy search across the local metadata cache — fast, no Vaultwarden round-trip. ' +
-      'Searches item name, username, URIs, folder, and field names. ' +
+      'Searches item name, username, URIs/domains, folder, and each custom field name individually — ' +
+      'no secret values are ever included. ' +
       'Typo-tolerant: "porkbun" finds "Porkbun API Key", "githb" finds "GitHub Token". ' +
+      'A query like "coolify" surfaces every related hit — "Coolify API Token", other items whose ' +
+      'domain is coolify.*, or items that merely have a custom field named e.g. "Coolify Token" — ' +
+      'and each result includes matchedOn, telling you exactly which attribute matched (name/domain/URI/' +
+      'folder/field name) so you know where to look next (e.g. vault_get_item or vault_reveal_password ' +
+      'for that specific field). Closely related items are kept together even past `limit`. ' +
       'Run vault_sync_cache first if the cache is empty or stale.',
     inputSchema: {
       type: 'object',
@@ -883,6 +889,7 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
         fieldNames: r.fieldNames,
         favorite: r.favorite,
         score: Math.round((1 - r.score) * 100) + '%',
+        matchedOn: r.matchedOn,
       }));
     }
 

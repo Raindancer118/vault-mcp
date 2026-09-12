@@ -34,6 +34,8 @@ export interface CachedItem {
 export interface SearchResult extends CachedItem {
   /** Fuse.js score: 0 = perfect match, 1 = no match */
   score: number;
+  /** Human-readable reasons this item matched, e.g. "field name: API Token", "domain: coolify.tstieh.de" */
+  matchedOn: string[];
 }
 
 export interface SyncStats {
@@ -184,11 +186,37 @@ function loadAll(vaultFilter?: string): CachedItem[] {
   return rows.map(rowToItem);
 }
 
+/** Extract a bare hostname from a URI for cleaner, more precise domain matching. */
+function extractDomain(uri: string): string | null {
+  try {
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(uri) ? uri : `https://${uri}`;
+    return new URL(withScheme).hostname.replace(/^www\./, '') || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Friendly labels for Fuse key paths, used to build human-readable `matchedOn` reasons. */
+const KEY_LABELS: Record<string, string> = {
+  name: 'name',
+  username: 'username',
+  domains: 'domain',
+  uris: 'URI',
+  folderName: 'folder',
+  fieldNames: 'field name',
+};
+
 /**
  * Fuzzy search across cached item metadata.
  *
- * Searches: name, username, uris (joined), folder name, field names (joined).
- * Returns up to `limit` results sorted by relevance.
+ * Searches: name, username, individual URIs, extracted domains, folder name,
+ * and each custom field name — each indexed as its own candidate (not a joined
+ * blob), so a match against e.g. one field name among many is still precise.
+ * Never returns secret values, only which attribute matched.
+ *
+ * Near-ties with the best match are kept even beyond `limit`, so closely
+ * related items (e.g. "Coolify", "Coolify API Token", "Coolify XY") surface
+ * together instead of one crowding the others out.
  */
 export function fuzzySearch(
   query: string,
@@ -197,34 +225,48 @@ export function fuzzySearch(
   const items = loadAll(options.vault);
   if (items.length === 0) return [];
 
-  // Flatten array fields to searchable strings for Fuse
   const searchable = items.map(item => ({
     ...item,
-    _uris: item.uris.join(' '),
-    _fieldNames: item.fieldNames.join(' '),
+    domains: [...new Set(item.uris.map(extractDomain).filter((d): d is string => !!d))],
   }));
 
   const fuse = new Fuse(searchable, {
     keys: [
-      { name: 'name',        weight: 3.0 },
-      { name: 'username',    weight: 1.5 },
-      { name: '_uris',       weight: 1.2 },
-      { name: 'folderName',  weight: 0.8 },
-      { name: '_fieldNames', weight: 0.6 },
+      { name: 'name',       weight: 3.0 },
+      { name: 'fieldNames', weight: 1.5 },
+      { name: 'domains',    weight: 1.5 },
+      { name: 'username',   weight: 1.3 },
+      { name: 'uris',       weight: 0.8 },
+      { name: 'folderName', weight: 0.8 },
     ],
     threshold: options.threshold ?? 0.45,
     includeScore: true,
+    includeMatches: true,
     ignoreLocation: true,
     useExtendedSearch: false,
     minMatchCharLength: 2,
   });
 
-  const results = fuse.search(query, { limit: options.limit ?? 20 });
+  const limit = options.limit ?? 20;
+  const pool = fuse.search(query, { limit: Math.max(limit * 3, 30) });
+  if (pool.length === 0) return [];
 
-  return results.map(r => ({
-    ...r.item,
-    score: r.score ?? 1,
-  }));
+  const bestScore = pool[0].score ?? 1;
+  const tieClusterSize = pool.filter(r => (r.score ?? 1) <= bestScore + 0.05).length;
+  const keep = Math.min(Math.max(limit, tieClusterSize), 30);
+
+  return pool.slice(0, keep).map(r => {
+    const matchedOn = (r.matches ?? []).map(m => {
+      const label = KEY_LABELS[m.key ?? ''] ?? m.key ?? 'field';
+      return m.value ? `${label}: ${m.value}` : label;
+    });
+    const { domains: _domains, ...item } = r.item;
+    return {
+      ...item,
+      score: r.score ?? 1,
+      matchedOn: [...new Set(matchedOn)],
+    };
+  });
 }
 
 /** Return the last sync timestamps for all vaults. */
