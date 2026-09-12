@@ -296,14 +296,31 @@ export class BitwardenClient {
     return items.map(toItemMeta);
   }
 
+  /**
+   * `bw get item` resolves against bw's local on-disk vault cache, not the server —
+   * unlike `list`/`search`, it never syncs that cache itself. If the cache is stale
+   * (e.g. after a session re-unlock that didn't refresh it) a genuinely existing item
+   * can come back "Not found" even though `list items` still sees it fine. Retry once
+   * after an explicit sync before giving up.
+   */
+  private async getRawItem(itemId: string): Promise<BwItemFull> {
+    try {
+      return JSON.parse(await this.bws(['get', 'item', itemId, '--raw']));
+    } catch (err) {
+      if (!(err as Error).message?.includes('Not found')) throw err;
+      await this.sync();
+      return JSON.parse(await this.bws(['get', 'item', itemId, '--raw']));
+    }
+  }
+
   async getItemMeta(itemId: string): Promise<BwItemMeta> {
-    const item: BwItemFull = JSON.parse(await this.bws(['get', 'item', itemId, '--raw']));
+    const item = await this.getRawItem(itemId);
     return toItemMeta(item);
   }
 
   /** Returns all sensitive values for one item — call only for vault_reveal_password. */
   async getItemSensitive(itemId: string): Promise<BwItemSensitive> {
-    const item: BwItemFull = JSON.parse(await this.bws(['get', 'item', itemId, '--raw']));
+    const item = await this.getRawItem(itemId);
     return {
       id: item.id,
       name: item.name,
@@ -320,7 +337,7 @@ export class BitwardenClient {
 
   /** Returns the full raw item for storage in the favorites vault. */
   async getItemForFavorites(itemId: string): Promise<BwItemFull> {
-    return JSON.parse(await this.bws(['get', 'item', itemId, '--raw']));
+    return this.getRawItem(itemId);
   }
 
   /**
@@ -342,18 +359,18 @@ export class BitwardenClient {
       const itemRef = ref.slice(0, colonIdx);
       const fieldName = ref.slice(colonIdx + 1).trim();
       try {
-        const item: BwItemFull = JSON.parse(await this.bws(['get', 'item', itemRef, '--raw']));
+        const item = await this.getRawItem(itemRef);
         return extractField(item, fieldName);
       } catch (err) {
         // If item lookup itself failed, the item name might contain a colon — fall through
         if ((err as Error).message?.includes('Not found')) {
-          const item: BwItemFull = JSON.parse(await this.bws(['get', 'item', ref, '--raw']));
+          const item = await this.getRawItem(ref);
           return extractValue(item);
         }
         throw err;
       }
     }
-    const item: BwItemFull = JSON.parse(await this.bws(['get', 'item', ref, '--raw']));
+    const item = await this.getRawItem(ref);
     return extractValue(item);
   }
 
@@ -389,7 +406,7 @@ export class BitwardenClient {
   }
 
   async updateItemValue(itemId: string, value: string, username?: string): Promise<void> {
-    const item: BwItemFull = JSON.parse(await this.bws(['get', 'item', itemId, '--raw']));
+    const item = await this.getRawItem(itemId);
 
     if (item.type === 1 && item.login) {
       item.login.password = value;
