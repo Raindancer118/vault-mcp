@@ -1,6 +1,7 @@
 import { execFile, exec } from 'child_process';
 import { promisify } from 'util';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmdirSync, statSync } from 'fs';
+import { randomBytes } from 'crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmdirSync, statSync, utimesSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { VaultInstanceConfig } from '../config/types.js';
@@ -101,9 +102,25 @@ const SESSION_TTL_MS = 18 * 60 * 1000;
 // surfaces as `bw get item` reporting "Not found" for items that genuinely exist. Guard
 // every bw invocation for a given instance with a cross-process lock (a lockfile-as-directory,
 // since mkdir is atomic) so only one `bw` process touches that instance's appdata dir at a time.
+//
+// A single bw call being atomic is not enough: session setup is a *sequence*
+// (status → logout → config server → login → unlock) and each step invalidates state the
+// other steps depend on. With per-call locking, two processes interleave their sequences —
+// one sees `unauthenticated`, another logs in underneath it, and the first then fails with
+// "Logout required before server config update", or wipes the freshly synced local vault so
+// the other's next `bw get item` reports "Not found". Every public operation therefore takes
+// the lock exactly once and runs its whole sequence (session setup + the actual command)
+// under it; the internal *Locked/bwRaw helpers are the unlocked building blocks.
 const LOCK_STALE_MS = 30_000;
 const LOCK_POLL_MS = 100;
-const LOCK_MAX_WAIT_MS = 25_000;
+// A single bw invocation takes 1-3s, and a whole Claude Code restart can queue a dozen
+// vault-launch children behind each other on the same instance. The wait budget has to
+// cover that whole queue, otherwise the serialization just converts the old corruption
+// into spurious timeouts.
+const LOCK_MAX_WAIT_MS = 180_000;
+// Touch the lock while it is held so a legitimately slow holder (an unlock waiting on the
+// GUI master-password prompt, a large sync) is never mistaken for a crashed one and stolen.
+const LOCK_HEARTBEAT_MS = 10_000;
 
 function normalizeUrl(url: string): string {
   return url.replace(/\/+$/, '').toLowerCase();
@@ -121,6 +138,8 @@ export class BitwardenClient {
   private readonly sessionFile: string;
   /** Master password obtained via GUI prompt — held in RAM only, never written to disk. */
   private promptedPassword: string | null = null;
+  /** In-process queue: serializes this client's own operations before the file lock. */
+  private lockChain: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly instanceName: string,
@@ -138,20 +157,66 @@ export class BitwardenClient {
     return join(this.dataDir, '.bw-lock');
   }
 
+  private get queuePath(): string {
+    return join(this.dataDir, '.bw-queue');
+  }
+
   /**
    * Acquire a cross-process lock on this instance's bw appdata dir. `mkdir` is atomic
    * (fails with EEXIST if the dir already exists), which makes it usable as a lockfile
    * without any extra dependency. A lock older than LOCK_STALE_MS is assumed to belong
    * to a crashed holder and is stolen. Returns a release function — always call it in a
    * `finally`.
+   *
+   * Waiters queue FIFO via a ticket file each: only the holder of the oldest live ticket
+   * attempts the mkdir. Without that, every waiter races on each poll and, in a burst of
+   * a dozen processes, one of them can lose every race until its budget runs out.
    */
   private async acquireLock(): Promise<() => void> {
     if (!existsSync(this.dataDir)) mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
+    if (!existsSync(this.queuePath)) mkdirSync(this.queuePath, { recursive: true, mode: 0o700 });
+
+    const ticket = join(this.queuePath, `${Date.now().toString().padStart(14, '0')}-${process.pid}-${randomBytes(4).toString('hex')}`);
+    writeFileSync(ticket, '', { mode: 0o600 });
+    const dropTicket = () => { try { unlinkSync(ticket); } catch { /* already gone */ } };
+
     const deadline = Date.now() + LOCK_MAX_WAIT_MS;
+    try {
+      return await this.acquireLockQueued(ticket, deadline, dropTicket);
+    } catch (err) {
+      dropTicket();
+      throw err;
+    }
+  }
+
+  private async acquireLockQueued(ticket: string, deadline: number, dropTicket: () => void): Promise<() => void> {
     for (;;) {
+      if (!this.isFirstInQueue(ticket)) {
+        if (Date.now() > deadline) {
+          throw new Error(
+            `Timed out waiting for the bw CLI lock on vault "${this.instanceName}" — ` +
+            `another process is using it. If this persists, remove ${this.lockPath}.`,
+          );
+        }
+        // Keep our ticket alive so other waiters don't prune us as a crashed process.
+        try { const now = new Date(); utimesSync(ticket, now, now); } catch { /* pruned — the next loop re-checks */ }
+        await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));
+        continue;
+      }
       try {
         mkdirSync(this.lockPath);
+        const heartbeat = setInterval(() => {
+          try {
+            const now = new Date();
+            utimesSync(this.lockPath, now, now);
+          } catch { /* lock gone (stolen or released) — nothing to refresh */ }
+        }, LOCK_HEARTBEAT_MS);
+        heartbeat.unref?.();
+        // Leave the queue only once the lock is actually ours, so no later arrival
+        // can slip in front while we are between ticket and lock.
+        dropTicket();
         return () => {
+          clearInterval(heartbeat);
           try { rmdirSync(this.lockPath); } catch { /* already gone — fine */ }
         };
       } catch (err) {
@@ -173,9 +238,55 @@ export class BitwardenClient {
     }
   }
 
-  private async bw(args: string[], extraEnv?: Record<string, string>): Promise<string> {
-    const release = await this.acquireLock();
+  /**
+   * True if our ticket is the oldest live one. Tickets whose holder stopped refreshing
+   * them (crashed process) are pruned so they can't block the queue forever.
+   */
+  private isFirstInQueue(ticket: string): boolean {
+    let entries: string[];
     try {
+      entries = readdirSync(this.queuePath);
+    } catch {
+      return true; // queue dir vanished — degrade to the plain mkdir race
+    }
+    const own = ticket.slice(this.queuePath.length + 1);
+    const live: string[] = [];
+    for (const name of entries) {
+      if (name === own) { live.push(name); continue; }
+      try {
+        if (Date.now() - statSync(join(this.queuePath, name)).mtimeMs > LOCK_STALE_MS) {
+          unlinkSync(join(this.queuePath, name)); // abandoned waiter
+          continue;
+        }
+      } catch { continue; } // vanished between readdir and stat
+      live.push(name);
+    }
+    // Filenames start with a zero-padded creation timestamp, so lexical order is arrival order.
+    return live.sort()[0] === own;
+  }
+
+  /**
+   * Run `fn` with this instance's bw appdata dir locked. In-process callers are queued on
+   * a promise chain first (so concurrent MCP requests don't spin on the file lock), then the
+   * cross-process file lock is taken for the whole of `fn`.
+   */
+  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.lockChain.then(async () => {
+      const release = await this.acquireLock();
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    });
+    // Keep the chain alive regardless of this operation's outcome.
+    this.lockChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /** Single bw invocation, lock already held by the caller. */
+  private async bwRaw(args: string[], extraEnv?: Record<string, string>): Promise<string> {
+    {
       // --nointeraction: never let bw drop to an interactive stdin prompt (e.g. asking
       // for the master password when the session is locked). Without a TTY that would
       // hang forever; instead bw errors out and we surface it. Unlocking is handled
@@ -194,9 +305,12 @@ export class BitwardenClient {
 
       void stderr; // intentionally ignored — bw writes progress to stderr
       return stdout.trim();
-    } finally {
-      release();
     }
+  }
+
+  /** Single bw invocation that takes the lock itself — for standalone, one-shot commands. */
+  private async bw(args: string[], extraEnv?: Record<string, string>): Promise<string> {
+    return this.withLock(() => this.bwRaw(args, extraEnv));
   }
 
   private async resolveMasterPassword(): Promise<string> {
@@ -253,7 +367,7 @@ export class BitwardenClient {
   /** Query `bw status` with a candidate token; returns parsed status or null on failure. */
   private async statusWithToken(token: string): Promise<{ status: string; serverUrl?: string } | null> {
     try {
-      const out = await this.bw(['status'], { BW_SESSION: token });
+      const out = await this.bwRaw(['status'], { BW_SESSION: token });
       const m = out.match(/\{[\s\S]*\}/);
       return m ? (JSON.parse(m[0]) as { status: string; serverUrl?: string }) : null;
     } catch {
@@ -262,6 +376,16 @@ export class BitwardenClient {
   }
 
   async ensureSession(): Promise<void> {
+    if (this.sessionToken && Date.now() < this.sessionExpiry) return;
+    return this.withLock(() => this.ensureSessionLocked());
+  }
+
+  /**
+   * Session setup, lock already held. Must never be called without the lock: the
+   * status → logout → config → login → unlock sequence is only safe if no other
+   * process can change the appdata dir between its steps.
+   */
+  private async ensureSessionLocked(): Promise<void> {
     if (this.sessionToken && Date.now() < this.sessionExpiry) return;
 
     // Reuse a session unlocked by another vault-mcp process (server or launcher),
@@ -279,7 +403,7 @@ export class BitwardenClient {
 
     let statusJson: string;
     try {
-      statusJson = await this.bw(['status']);
+      statusJson = await this.bwRaw(['status']);
     } catch {
       statusJson = '{"status":"unauthenticated"}';
     }
@@ -298,21 +422,21 @@ export class BitwardenClient {
 
     if (needsReconfigure) {
       if (status !== 'unauthenticated') {
-        await this.bw(['logout']).catch(() => { /* ignore if not logged in */ });
+        await this.bwRaw(['logout']).catch(() => { /* ignore if not logged in */ });
         status = 'unauthenticated';
       }
-      await this.bw(['config', 'server', this.cfg.url]);
+      await this.bwRaw(['config', 'server', this.cfg.url]);
     }
 
     if (status === 'unauthenticated') {
-      await this.bw(['login', '--apikey'], {
+      await this.bwRaw(['login', '--apikey'], {
         BW_CLIENTID: this.cfg.clientId,
         BW_CLIENTSECRET: this.cfg.clientSecret,
       });
     }
 
     const password = await this.resolveMasterPassword();
-    const token = await this.bw(['unlock', '--passwordenv', 'BW_PASSWORD', '--raw'], {
+    const token = await this.bwRaw(['unlock', '--passwordenv', 'BW_PASSWORD', '--raw'], {
       BW_PASSWORD: password,
     });
 
@@ -323,9 +447,16 @@ export class BitwardenClient {
     this.persistToken(token);
   }
 
+  /**
+   * Session-authenticated bw call: takes the lock once and runs session setup *and* the
+   * command under it, so no other process can log out, reconfigure or re-sync the appdata
+   * dir in between (which is what turned existing items into "Not found").
+   */
   private async bws(args: string[]): Promise<string> {
-    await this.ensureSession();
-    return this.bw(args, { BW_SESSION: this.sessionToken! });
+    return this.withLock(async () => {
+      await this.ensureSessionLocked();
+      return this.bwRaw(args, { BW_SESSION: this.sessionToken! });
+    });
   }
 
   async sync(): Promise<void> {
@@ -337,10 +468,16 @@ export class BitwardenClient {
   }
 
   async listItems(folderId?: string): Promise<BwItemMeta[]> {
-    await this.sync();
     const args = ['list', 'items', '--raw'];
     if (folderId) args.push('--folderid', folderId);
-    const items: BwItemFull[] = JSON.parse(await this.bws(args));
+    // Sync and list under one lock — otherwise another process can log out or resync
+    // between the two and the list comes back empty.
+    const raw = await this.withLock(async () => {
+      await this.ensureSessionLocked();
+      await this.bwRaw(['sync'], { BW_SESSION: this.sessionToken! });
+      return this.bwRaw(args, { BW_SESSION: this.sessionToken! });
+    });
+    const items: BwItemFull[] = JSON.parse(raw);
     return items.map(toItemMeta);
   }
 
@@ -353,19 +490,27 @@ export class BitwardenClient {
 
   /**
    * `bw get item` resolves against bw's local on-disk vault cache, not the server —
-   * unlike `list`/`search`, it never syncs that cache itself. If the cache is stale
-   * (e.g. after a session re-unlock that didn't refresh it) a genuinely existing item
-   * can come back "Not found" even though `list items` still sees it fine. Retry once
-   * after an explicit sync before giving up.
+   * unlike `list`/`search`, it never syncs that cache itself. If the cache is stale or was
+   * emptied by another process re-authenticating (or our cached session token was
+   * invalidated by that), a genuinely existing item comes back "Not found". Recover once:
+   * drop the cached session, re-establish it and sync — all inside the same lock, so the
+   * recovery can't race the very processes that caused the problem.
    */
   private async getRawItem(itemId: string): Promise<BwItemFull> {
-    try {
-      return JSON.parse(await this.bws(['get', 'item', itemId, '--raw']));
-    } catch (err) {
-      if (!(err as Error).message?.includes('Not found')) throw err;
-      await this.sync();
-      return JSON.parse(await this.bws(['get', 'item', itemId, '--raw']));
-    }
+    return this.withLock(async () => {
+      await this.ensureSessionLocked();
+      const get = () => this.bwRaw(['get', 'item', itemId, '--raw'], { BW_SESSION: this.sessionToken! });
+      try {
+        return JSON.parse(await get());
+      } catch (err) {
+        if (!isRecoverableLookupError(err as Error)) throw err;
+        this.sessionToken = null;
+        this.sessionExpiry = 0;
+        await this.ensureSessionLocked();
+        await this.bwRaw(['sync'], { BW_SESSION: this.sessionToken! });
+        return JSON.parse(await get());
+      }
+    });
   }
 
   async getItemMeta(itemId: string): Promise<BwItemMeta> {
@@ -489,6 +634,15 @@ export class BitwardenClient {
     const folders = await this.listFolders();
     return folders.find(f => f.name === name);
   }
+}
+
+/**
+ * Errors that mean "our view of the local vault/session went stale", not "this item does
+ * not exist" — all of them are fixed by re-unlocking and syncing, so a lookup hitting one
+ * is worth exactly one retry.
+ */
+function isRecoverableLookupError(err: Error): boolean {
+  return /not found|not logged in|vault is locked|mac failed|invalid master password/i.test(err.message ?? '');
 }
 
 function toItemMeta(item: BwItemFull): BwItemMeta {
