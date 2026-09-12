@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, utimesSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -97,5 +97,62 @@ describe('BitwardenClient.getRawItem', () => {
     });
 
     await expect((client as any).getRawItem('missing-id')).rejects.toThrow(/Not found/);
+  });
+});
+
+describe('BitwardenClient.acquireLock', () => {
+  let tmpHome: string;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), 'vault-mcp-lock-test-'));
+    vi.spyOn(require('os'), 'homedir').mockReturnValue(tmpHome);
+  });
+
+  async function makeClient() {
+    const { BitwardenClient } = await import('./bw-client.js');
+    return new BitwardenClient('testvault', {
+      url: 'https://vault.example.com',
+      clientId: 'id',
+      clientSecret: 'secret',
+      masterPassword: 'pw',
+    } as any);
+  }
+
+  it('serializes two concurrent callers: the second only acquires after the first releases', async () => {
+    const client = await makeClient();
+
+    const release1 = await (client as any).acquireLock();
+    expect(existsSync((client as any).lockPath)).toBe(true);
+
+    let secondAcquired = false;
+    const secondPromise = (client as any).acquireLock().then((release2: () => void) => {
+      secondAcquired = true;
+      release2();
+    });
+
+    // Give the poll loop a couple of ticks — it must still be waiting.
+    await new Promise(r => setTimeout(r, 250));
+    expect(secondAcquired).toBe(false);
+
+    release1();
+    await secondPromise;
+    expect(secondAcquired).toBe(true);
+    expect(existsSync((client as any).lockPath)).toBe(false);
+  });
+
+  it('steals a stale lock left behind by a crashed process instead of blocking forever', async () => {
+    const client = await makeClient();
+    const lockPath = (client as any).lockPath as string;
+
+    // Simulate a lock directory abandoned by a crashed process: present on disk,
+    // but old enough to exceed the staleness threshold.
+    mkdirSync(lockPath, { recursive: true });
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, old, old);
+
+    const release = await (client as any).acquireLock();
+    expect(existsSync(lockPath)).toBe(true); // re-created by the successful acquire
+    release();
+    expect(existsSync(lockPath)).toBe(false);
   });
 });

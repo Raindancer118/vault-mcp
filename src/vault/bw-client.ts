@@ -1,6 +1,6 @@
 import { execFile, exec } from 'child_process';
 import { promisify } from 'util';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { VaultInstanceConfig } from '../config/types.js';
@@ -92,6 +92,19 @@ export interface BwFolder {
 
 const SESSION_TTL_MS = 18 * 60 * 1000;
 
+// The bw CLI's local vault cache (BITWARDENCLI_APPDATA_DIR/data.json) is a plain file
+// with no locking of its own. This machine routinely runs many independent processes
+// against the *same* vault instance concurrently — vault-mcp itself plus one vault-launch
+// child per downstream MCP server (cis, obsidian, spoticontrol, github, gemini, ...), all
+// spawned in a burst on every Claude Code restart. Two of them syncing/unlocking at the
+// same time can interleave writes to that file and corrupt or truncate it, which then
+// surfaces as `bw get item` reporting "Not found" for items that genuinely exist. Guard
+// every bw invocation for a given instance with a cross-process lock (a lockfile-as-directory,
+// since mkdir is atomic) so only one `bw` process touches that instance's appdata dir at a time.
+const LOCK_STALE_MS = 30_000;
+const LOCK_POLL_MS = 100;
+const LOCK_MAX_WAIT_MS = 25_000;
+
 function normalizeUrl(url: string): string {
   return url.replace(/\/+$/, '').toLowerCase();
 }
@@ -121,27 +134,69 @@ export class BitwardenClient {
     return { ...process.env, BITWARDENCLI_APPDATA_DIR: this.dataDir };
   }
 
-  private async bw(args: string[], extraEnv?: Record<string, string>): Promise<string> {
+  private get lockPath(): string {
+    return join(this.dataDir, '.bw-lock');
+  }
+
+  /**
+   * Acquire a cross-process lock on this instance's bw appdata dir. `mkdir` is atomic
+   * (fails with EEXIST if the dir already exists), which makes it usable as a lockfile
+   * without any extra dependency. A lock older than LOCK_STALE_MS is assumed to belong
+   * to a crashed holder and is stolen. Returns a release function — always call it in a
+   * `finally`.
+   */
+  private async acquireLock(): Promise<() => void> {
     if (!existsSync(this.dataDir)) mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
-
-    // --nointeraction: never let bw drop to an interactive stdin prompt (e.g. asking
-    // for the master password when the session is locked). Without a TTY that would
-    // hang forever; instead bw errors out and we surface it. Unlocking is handled
-    // explicitly via resolveMasterPassword() + the GUI/HTTP prompt.
-    const { stdout, stderr } = await execFileAsync('bw', ['--nointeraction', ...args], {
-      env: { ...this.baseEnv(), ...extraEnv },
-      maxBuffer: 50 * 1024 * 1024,
-    }).catch((err: NodeJS.ErrnoException & { stdout?: string; stderr?: string }) => {
-      if (err.code === 'ENOENT') {
-        throw new Error('Bitwarden CLI (bw) not found. Install it: https://bitwarden.com/help/cli/');
+    const deadline = Date.now() + LOCK_MAX_WAIT_MS;
+    for (;;) {
+      try {
+        mkdirSync(this.lockPath);
+        return () => {
+          try { rmdirSync(this.lockPath); } catch { /* already gone — fine */ }
+        };
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+        try {
+          if (Date.now() - statSync(this.lockPath).mtimeMs > LOCK_STALE_MS) {
+            rmdirSync(this.lockPath); // stale — steal it, loop retries immediately
+            continue;
+          }
+        } catch { /* lock vanished between mkdir and stat — retry */ }
+        if (Date.now() > deadline) {
+          throw new Error(
+            `Timed out waiting for the bw CLI lock on vault "${this.instanceName}" — ` +
+            `another process is using it. If this persists, remove ${this.lockPath}.`,
+          );
+        }
+        await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));
       }
-      // bw sometimes writes errors to stderr but exits with non-zero even on success — include both
-      const detail = err.stderr?.trim() || err.stdout?.trim() || err.message;
-      throw new Error(`bw ${args[0]} failed: ${detail}`);
-    });
+    }
+  }
 
-    void stderr; // intentionally ignored — bw writes progress to stderr
-    return stdout.trim();
+  private async bw(args: string[], extraEnv?: Record<string, string>): Promise<string> {
+    const release = await this.acquireLock();
+    try {
+      // --nointeraction: never let bw drop to an interactive stdin prompt (e.g. asking
+      // for the master password when the session is locked). Without a TTY that would
+      // hang forever; instead bw errors out and we surface it. Unlocking is handled
+      // explicitly via resolveMasterPassword() + the GUI/HTTP prompt.
+      const { stdout, stderr } = await execFileAsync('bw', ['--nointeraction', ...args], {
+        env: { ...this.baseEnv(), ...extraEnv },
+        maxBuffer: 50 * 1024 * 1024,
+      }).catch((err: NodeJS.ErrnoException & { stdout?: string; stderr?: string }) => {
+        if (err.code === 'ENOENT') {
+          throw new Error('Bitwarden CLI (bw) not found. Install it: https://bitwarden.com/help/cli/');
+        }
+        // bw sometimes writes errors to stderr but exits with non-zero even on success — include both
+        const detail = err.stderr?.trim() || err.stdout?.trim() || err.message;
+        throw new Error(`bw ${args[0]} failed: ${detail}`);
+      });
+
+      void stderr; // intentionally ignored — bw writes progress to stderr
+      return stdout.trim();
+    } finally {
+      release();
+    }
   }
 
   private async resolveMasterPassword(): Promise<string> {
