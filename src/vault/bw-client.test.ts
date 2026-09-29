@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, existsSync, utimesSync, statSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, utimesSync, statSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -347,5 +347,81 @@ describe('BitwardenClient.acquireLock', () => {
     expect(existsSync(lockPath)).toBe(true); // re-created by the successful acquire
     release();
     expect(existsSync(lockPath)).toBe(false);
+  });
+});
+
+describe('BitwardenClient launcher fast path', () => {
+  let tmpHome: string;
+  const cfg = { url: 'https://vault.example.com', clientId: 'id', clientSecret: 'secret', masterPassword: 'pw' } as any;
+  const item = { id: 'abc-123', name: 'Test Item', type: 1, login: { username: 'u', password: 'p' } };
+
+  beforeEach(() => {
+    execFileMock.mockReset();
+    execMock.mockReset();
+    tmpHome = mkdtempSync(join(tmpdir(), 'vault-mcp-test-'));
+    vi.spyOn(require('os'), 'homedir').mockReturnValue(tmpHome);
+  });
+
+  function persistToken(client: any, token: string) {
+    mkdirSync(client.dataDir, { recursive: true });
+    writeFileSync(client.sessionFile, JSON.stringify({ token }));
+  }
+
+  it('fetches each distinct item only once when several refs point at it', async () => {
+    const { BitwardenClient } = await import('./bw-client.js');
+    const client = new BitwardenClient('testvault', cfg);
+    (client as any).sessionToken = 'session-token';
+    (client as any).sessionExpiry = Date.now() + 60_000;
+    execFileMock.mockImplementation(cb(JSON.stringify(item)));
+
+    const resolve = client.createResolver();
+    expect(await resolve('abc-123:username')).toBe('u');
+    expect(await resolve('abc-123:password')).toBe('p');
+    expect(await resolve('abc-123')).toBe('p');
+
+    const gets = execFileMock.mock.calls.filter(c => (c[1] as string[]).includes('get'));
+    expect(gets).toHaveLength(1);
+  });
+
+  it('uses a persisted session token for item lookups without a bw status round-trip', async () => {
+    const { BitwardenClient } = await import('./bw-client.js');
+    const client = new BitwardenClient('testvault', cfg);
+    persistToken(client, 'persisted-token');
+    execFileMock.mockImplementation(cb(JSON.stringify(item)));
+
+    expect(await client.resolveValue('abc-123:username')).toBe('u');
+
+    const calls = execFileMock.mock.calls.map(c => (c[1] as string[]).filter(a => a !== '--nointeraction')[0]);
+    expect(calls).toEqual(['get']);
+    expect((execFileMock.mock.calls[0][2] as any).env.BW_SESSION).toBe('persisted-token');
+  });
+
+  it('falls back to a full unlock when the persisted token turns out to be stale', async () => {
+    const { BitwardenClient } = await import('./bw-client.js');
+    const client = new BitwardenClient('testvault', cfg);
+    persistToken(client, 'stale-token');
+
+    execFileMock.mockImplementation((_f: string, args: string[], opts: any, callback: any) => {
+      if (args.includes('get')) {
+        if (opts.env.BW_SESSION === 'stale-token') {
+          callback(Object.assign(new Error('Vault is locked.'), { stderr: 'Vault is locked.', stdout: '' }));
+        } else {
+          callback(null, { stdout: JSON.stringify(item), stderr: '' });
+        }
+        return;
+      }
+      if (args.includes('status')) {
+        callback(null, { stdout: '{"status":"locked","serverUrl":"https://vault.example.com"}', stderr: '' });
+        return;
+      }
+      if (args.includes('unlock')) {
+        callback(null, { stdout: 'fresh-token', stderr: '' });
+        return;
+      }
+      callback(null, { stdout: '', stderr: '' });
+    });
+
+    expect(await client.resolveValue('abc-123:password')).toBe('p');
+    expect((client as any).sessionToken).toBe('fresh-token');
   });
 });

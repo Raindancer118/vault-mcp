@@ -498,7 +498,18 @@ export class BitwardenClient {
    */
   private async getRawItem(itemId: string): Promise<BwItemFull> {
     return this.withLock(async () => {
-      await this.ensureSessionLocked();
+      // Optimistic: trust a persisted token without the extra `bw status` call (each bw
+      // invocation costs seconds, and a Claude Code restart queues every vault-launch
+      // behind the same lock). A stale token fails the get and takes the recovery path.
+      if (!(this.sessionToken && Date.now() < this.sessionExpiry)) {
+        const persisted = this.readPersistedToken();
+        if (persisted) {
+          this.sessionToken = persisted;
+          this.sessionExpiry = Date.now() + SESSION_TTL_MS;
+        } else {
+          await this.ensureSessionLocked();
+        }
+      }
       const get = () => this.bwRaw(['get', 'item', itemId, '--raw'], { BW_SESSION: this.sessionToken! });
       try {
         return JSON.parse(await get());
@@ -554,23 +565,46 @@ export class BitwardenClient {
    * If the item name itself contains a colon, use the item's UUID instead.
    */
   async resolveValue(ref: string): Promise<string> {
+    return this.resolveWith(ref, (id) => this.getRawItem(id));
+  }
+
+  /**
+   * Resolver for one-shot use (vault-launch): each distinct item is fetched once, so
+   * `X:username` + `X:password` cost a single bw call. Not for long-lived callers —
+   * the memo never expires.
+   */
+  createResolver(): (ref: string) => Promise<string> {
+    const memo = new Map<string, Promise<BwItemFull>>();
+    const fetch = (id: string) => {
+      let p = memo.get(id);
+      if (!p) {
+        p = this.getRawItem(id);
+        p.catch(() => memo.delete(id));
+        memo.set(id, p);
+      }
+      return p;
+    };
+    return (ref) => this.resolveWith(ref, fetch);
+  }
+
+  private async resolveWith(ref: string, fetch: (id: string) => Promise<BwItemFull>): Promise<string> {
     const colonIdx = ref.indexOf(':');
     if (colonIdx > 0) {
       const itemRef = ref.slice(0, colonIdx);
       const fieldName = ref.slice(colonIdx + 1).trim();
       try {
-        const item = await this.getRawItem(itemRef);
+        const item = await fetch(itemRef);
         return extractField(item, fieldName);
       } catch (err) {
         // If item lookup itself failed, the item name might contain a colon — fall through
         if ((err as Error).message?.includes('Not found')) {
-          const item = await this.getRawItem(ref);
+          const item = await fetch(ref);
           return extractValue(item);
         }
         throw err;
       }
     }
-    const item = await this.getRawItem(ref);
+    const item = await fetch(ref);
     return extractValue(item);
   }
 

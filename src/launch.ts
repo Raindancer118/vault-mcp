@@ -110,7 +110,7 @@ async function main(): Promise<void> {
   const client = new BitwardenClient(vaultName, instanceCfg);
 
   const { env, args } = await prepareInjection(
-    (ref) => client.resolveValue(ref),
+    client.createResolver(),
     parsed.command,
     { envMappings: parsed.envMappings, argRefs: parsed.argRefs },
   );
