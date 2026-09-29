@@ -13,6 +13,14 @@ vi.mock('child_process', () => ({
   exec: (...args: unknown[]) => (execMock as any)(...args),
 }));
 
+// ESM named imports can't be spied on after the fact — mock the module so the client's
+// dataDir lands in a per-test temp home instead of the real ~/.cache.
+let fakeHome = '';
+vi.mock('os', async (importOriginal) => {
+  const real = await importOriginal<typeof import('os')>();
+  return { ...real, homedir: () => fakeHome || real.homedir() };
+});
+
 function cb(stdout: string) {
   return (_file: string, _args: string[], _opts: unknown, callback: (err: unknown, r: { stdout: string; stderr: string }) => void) => {
     callback(null, { stdout, stderr: '' });
@@ -32,7 +40,7 @@ describe('BitwardenClient.getRawItem', () => {
     execFileMock.mockReset();
     execMock.mockReset();
     tmpHome = mkdtempSync(join(tmpdir(), 'vault-mcp-test-'));
-    vi.spyOn(require('os'), 'homedir').mockReturnValue(tmpHome);
+    fakeHome = tmpHome;
   });
 
   it('retries after a sync when "bw get item" reports Not found, and succeeds if the retry finds it', async () => {
@@ -161,7 +169,7 @@ describe('BitwardenClient session setup atomicity', () => {
     execFileMock.mockReset();
     execMock.mockReset();
     tmpHome = mkdtempSync(join(tmpdir(), 'vault-mcp-session-test-'));
-    vi.spyOn(require('os'), 'homedir').mockReturnValue(tmpHome);
+    fakeHome = tmpHome;
   });
 
   async function makeClient() {
@@ -255,7 +263,7 @@ describe('BitwardenClient.acquireLock', () => {
 
   beforeEach(() => {
     tmpHome = mkdtempSync(join(tmpdir(), 'vault-mcp-lock-test-'));
-    vi.spyOn(require('os'), 'homedir').mockReturnValue(tmpHome);
+    fakeHome = tmpHome;
   });
 
   async function makeClient() {
@@ -359,7 +367,7 @@ describe('BitwardenClient launcher fast path', () => {
     execFileMock.mockReset();
     execMock.mockReset();
     tmpHome = mkdtempSync(join(tmpdir(), 'vault-mcp-test-'));
-    vi.spyOn(require('os'), 'homedir').mockReturnValue(tmpHome);
+    fakeHome = tmpHome;
   });
 
   function persistToken(client: any, token: string) {
@@ -423,5 +431,48 @@ describe('BitwardenClient launcher fast path', () => {
 
     expect(await client.resolveValue('abc-123:password')).toBe('p');
     expect((client as any).sessionToken).toBe('fresh-token');
+  });
+
+  it('runs item lookups against a private snapshot without holding the lock', async () => {
+    const { BitwardenClient } = await import('./bw-client.js');
+    const client = new BitwardenClient('testvault', cfg);
+    persistToken(client, 'persisted-token');
+    writeFileSync(join((client as any).dataDir, 'data.json'), '{"x":1}');
+
+    let seen: { dir: string; lockHeld: boolean; hasData: boolean } | null = null;
+    execFileMock.mockImplementation((_f: string, args: string[], opts: any, callback: any) => {
+      const dir = opts.env.BITWARDENCLI_APPDATA_DIR;
+      seen = { dir, lockHeld: existsSync((client as any).lockPath), hasData: existsSync(join(dir, 'data.json')) };
+      callback(null, { stdout: JSON.stringify(item), stderr: '' });
+    });
+
+    expect(await client.resolveValue('abc-123:password')).toBe('p');
+    expect(seen!.dir).not.toBe((client as any).dataDir);
+    expect(seen!.hasData).toBe(true);
+    expect(seen!.lockHeld).toBe(false);
+    expect(existsSync(seen!.dir)).toBe(false); // snapshot cleaned up
+  });
+
+  it('adopts a token another process refreshed meanwhile instead of re-checking under the lock', async () => {
+    const { BitwardenClient } = await import('./bw-client.js');
+    const client = new BitwardenClient('testvault', cfg);
+    persistToken(client, 'stale-token');
+    writeFileSync(join((client as any).dataDir, 'data.json'), '{"x":1}');
+
+    const calls: Array<{ cmd: string; token: string; locked: boolean }> = [];
+    execFileMock.mockImplementation((_f: string, args: string[], opts: any, callback: any) => {
+      const cmd = args.filter(a => a !== '--nointeraction')[0];
+      calls.push({ cmd, token: opts.env.BW_SESSION, locked: existsSync((client as any).lockPath) });
+      if (cmd === 'get' && opts.env.BW_SESSION === 'stale-token') {
+        persistToken(client, 'fresh-token'); // another launcher unlocked while we were reading
+        callback(Object.assign(new Error('Vault is locked.'), { stderr: 'Vault is locked.', stdout: '' }));
+        return;
+      }
+      callback(null, { stdout: JSON.stringify(item), stderr: '' });
+    });
+
+    expect(await client.resolveValue('abc-123:password')).toBe('p');
+    expect(calls.map(c => c.cmd)).toEqual(['get', 'get']);
+    expect(calls[1]).toMatchObject({ token: 'fresh-token', locked: false });
   });
 });

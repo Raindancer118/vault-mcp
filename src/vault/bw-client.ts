@@ -1,7 +1,7 @@
 import { execFile, exec } from 'child_process';
 import { promisify } from 'util';
 import { randomBytes } from 'crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmdirSync, statSync, utimesSync, unlinkSync, readdirSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, copyFileSync, rmSync, readFileSync, writeFileSync, rmdirSync, statSync, utimesSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { VaultInstanceConfig } from '../config/types.js';
@@ -497,18 +497,47 @@ export class BitwardenClient {
    * recovery can't race the very processes that caused the problem.
    */
   private async getRawItem(itemId: string): Promise<BwItemFull> {
-    return this.withLock(async () => {
-      // Optimistic: trust a persisted token without the extra `bw status` call (each bw
-      // invocation costs seconds, and a Claude Code restart queues every vault-launch
-      // behind the same lock). A stale token fails the get and takes the recovery path.
-      if (!(this.sessionToken && Date.now() < this.sessionExpiry)) {
-        const persisted = this.readPersistedToken();
-        if (persisted) {
+    // `bw get` rewrites data.json even though it only reads, so running it on the shared
+    // dir needs the lock. On a private copy it doesn't — lookups from every vault-launch
+    // in a startup burst run in parallel instead of queueing seconds each. The lock is
+    // only held to pick a token and copy the file.
+    let failedToken: string | null = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const snapshot = await this.withLock(async () => {
+        // Optimistic: trust a persisted token without a `bw status` round-trip. A token
+        // that already failed is only replaced if another process has refreshed it since.
+        if (failedToken !== null || !(this.sessionToken && Date.now() < this.sessionExpiry)) {
+          const persisted = this.readPersistedToken();
+          if (!persisted || persisted === failedToken) return null;
           this.sessionToken = persisted;
           this.sessionExpiry = Date.now() + SESSION_TTL_MS;
-        } else {
-          await this.ensureSessionLocked();
         }
+        return this.snapshotDataDir();
+      });
+      if (!snapshot) break;
+
+      try {
+        return JSON.parse(await this.bwRaw(['get', 'item', itemId, '--raw'], {
+          BW_SESSION: this.sessionToken!,
+          BITWARDENCLI_APPDATA_DIR: snapshot,
+        }));
+      } catch (err) {
+        if (!isRecoverableLookupError(err as Error)) throw err;
+        failedToken = this.sessionToken;
+        this.sessionToken = null;
+        this.sessionExpiry = 0;
+      } finally {
+        rmSync(snapshot, { recursive: true, force: true });
+      }
+    }
+
+    return this.withLock(async () => {
+      if (failedToken !== null) {
+        // Snapshot lookup failed: the session or the local cache is stale. Re-unlock and sync.
+        await this.ensureSessionLocked();
+        await this.bwRaw(['sync'], { BW_SESSION: this.sessionToken! });
+      } else {
+        await this.ensureSessionLocked();
       }
       const get = () => this.bwRaw(['get', 'item', itemId, '--raw'], { BW_SESSION: this.sessionToken! });
       try {
@@ -522,6 +551,17 @@ export class BitwardenClient {
         return JSON.parse(await get());
       }
     });
+  }
+
+  /** Private copy of the bw appdata (lock held by caller), or null if there is nothing to copy yet. */
+  private snapshotDataDir(): string | null {
+    const data = join(this.dataDir, 'data.json');
+    if (!existsSync(data)) return null;
+    const root = join(homedir(), '.cache', 'vault-mcp', 'bw-snap');
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const dir = mkdtempSync(join(root, `${this.instanceName}-`));
+    copyFileSync(data, join(dir, 'data.json'));
+    return dir;
   }
 
   async getItemMeta(itemId: string): Promise<BwItemMeta> {
